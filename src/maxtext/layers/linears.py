@@ -487,6 +487,7 @@ class MlpBlock(nnx.Module):
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
 
+  @jax.named_call
   def __call__(
       self,
       inputs,

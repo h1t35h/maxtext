@@ -1068,6 +1068,7 @@ class Attention(nnx.Module):
     )
     return output, kv_cache
 
+  @jax.named_call
   def __call__(
       self,
       inputs_q: Array,
