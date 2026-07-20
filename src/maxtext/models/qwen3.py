@@ -1577,7 +1577,6 @@ class Qwen3DecoderLayer(AttentionWithNorm):
             model_mode=model_mode,
             rngs=rngs,
         )
-
     def __call__(
         self,
         inputs: jnp.ndarray,

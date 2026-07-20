@@ -1021,7 +1021,8 @@ class NNXDecoder(nnx.Module):
       if kv_cache_layer is not None:
         call_kwargs["kv_cache"] = kv_cache_layer
 
-      layer_out = layer(carry, *args, **call_kwargs)
+      with jax.named_scope(layer.__class__.__name__):
+        layer_out = layer(carry, *args, **call_kwargs)
 
       if isinstance(layer_out, tuple):
         new_carry = layer_out[0]
