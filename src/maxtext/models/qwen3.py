@@ -143,8 +143,8 @@ def naive_jax_chunk_gated_delta_rule(
 
   xs = (query_scan, key_scan, value_scan, k_cumdecay_scan, g_scan, decay_mask_scan)
 
-  def scan_body(prev_state, x):
-    with jax.named_scope("naive_gdn_scan_body"):
+  @jax.named_call
+  def naive_gdn_scan_body(prev_state, x):
       q_i, k_i, v_i, k_cumdecay_i, g_i, decay_mask_i = x
       last_recurrent_state = prev_state
       prec = jax.lax.Precision.HIGHEST
@@ -171,7 +171,11 @@ def naive_jax_chunk_gated_delta_rule(
   
       return new_last_recurrent_state, core_attn_out_i
 
-  final_state, core_attn_out_stacked = jax.lax.scan(scan_body, last_recurrent_state, xs)
+  @jax.named_call
+  def naive_gdn_scan(naive_gdn_scan_body, last_recurrent_state, xs):
+    return jax.lax.scan(naive_gdn_scan_body, last_recurrent_state, xs)
+
+  final_state, core_attn_out_stacked = naive_gdn_scan(naive_gdn_scan_body, last_recurrent_state, xs)
 
   core_attn_out = jnp.transpose(core_attn_out_stacked, (1, 2, 0, 3, 4))
   core_attn_out = core_attn_out.reshape(batch_size, num_heads, -1, v_head_dim)
@@ -299,8 +303,8 @@ def jax_chunk_gated_delta_rule(
 
   xs = (w_scan, u_scan, q_scan, k_scan, g_scan)
 
-  def scan_body(h, args):
-    with jax.named_scope("gdn_scan_body"):
+  @jax.named_call
+  def gdn_scan_body(h, args):
       w, u, q, k, g = args
       prec = jax.lax.Precision.HIGHEST
   
@@ -346,7 +350,11 @@ def jax_chunk_gated_delta_rule(
   
       return h_new, o_c
 
-  final_h, o_chunks = lax.scan(scan_body, h_init, xs)
+  @jax.named_call
+  def gdn_scan(gdn_scan_body, h_init, xs):
+    return lax.scan(gdn_scan_body, h_init, xs)
+
+  final_h, o_chunks = gdn_scan(gdn_scan_body, h_init, xs)
 
   # =========================================================================
   # STAGE 4: FINALIZATION
@@ -1226,7 +1234,8 @@ class Qwen3NextScannableBlock(nnx.Module):
       value for the scan's `y` collection.
     """
     # The output of the block is the carry for the next scan iteration.
-    with jax.named_scope("qwen3_scannable_block"):
+    @jax.named_call
+    def qwen3_scannable_block(carry, _):
       cfg = self.config
       x = carry
   

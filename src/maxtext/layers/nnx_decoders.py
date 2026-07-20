@@ -344,23 +344,26 @@ class NNXScannedPipelineStage(nnx.Module):
     if scan_axis != 0:
       params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
 
-    def layer_fn(carry, scanned_vars):
-      with jax.named_scope("nnx_scan_layer"):
-        current_params, current_state = scanned_vars
-        layer = nnx.merge(graphdef, current_params, current_state)
-        layer_out = layer(
-            carry,
-            decoder_segment_ids,
-            decoder_positions,
-            deterministic,
-            model_mode,
-            **kwargs,
-        )
-        new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-        return new_carry, nnx.state(layer)
+    @jax.named_call
+    def nnx_scan_layer(carry, scanned_vars):
+      current_params, current_state = scanned_vars
+      layer = nnx.merge(graphdef, current_params, current_state)
+      layer_out = layer(
+          carry,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          **kwargs,
+      )
+      new_carry = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+      return new_carry, nnx.state(layer)
 
-    with jax.named_scope("nnx_decoder_scan"):
-      final_carry, scanned_state = jax.lax.scan(layer_fn, inputs, (params, state))
+    @jax.named_call
+    def nnx_decoder_scan(inputs, params, state):
+      return jax.lax.scan(nnx_scan_layer, inputs, (params, state))
+      
+    final_carry, scanned_state = nnx_decoder_scan(inputs, params, state)
 
     if scan_axis != 0:
       scanned_params, scanned_other = scanned_state.split(nnx.Param, ...)
@@ -993,12 +996,12 @@ class NNXDecoder(nnx.Module):
 
     use_kv = kv_caches_stacked is not None
 
-    def layer_fn(carry, scanned_vars):
-      with jax.named_scope("nnx_scan_layer"):
-        # Ensure metadata rank matches the sliced values
-        scanned_vars = maxtext_utils_nnx.nnx_remove_scan_axis(scanned_vars, "layers")
-  
-        # Unpack the sliced variables for THIS layer
+    @jax.named_call
+    def nnx_scan_layer(carry, scanned_vars):
+      # Ensure metadata rank matches the sliced values
+      scanned_vars = maxtext_utils_nnx.nnx_remove_scan_axis(scanned_vars, "layers")
+
+      # Unpack the sliced variables for THIS layer
       if use_kv:
         current_params, current_state, kv_cache_layer = scanned_vars
       else:
@@ -1040,7 +1043,7 @@ class NNXDecoder(nnx.Module):
           return new_carry, (new_current_state, updated_kv)
         return new_carry, new_current_state
 
-    layer_fn_wrapped = jax.checkpoint(layer_fn, policy=policy, prevent_cse=prevent_cse)
+    layer_fn_wrapped = jax.checkpoint(nnx_scan_layer, policy=policy, prevent_cse=prevent_cse)
 
     if use_kv:
       # If kv_caches is provided (e.g., from vLLM), we CANNOT use jax.lax.scan
@@ -1072,8 +1075,11 @@ class NNXDecoder(nnx.Module):
       params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, length)
       state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, length)
 
-      with jax.named_scope("nnx_decoder_scan"):
-        final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, (params, state))
+      @jax.named_call
+      def nnx_decoder_scan(layer_fn_wrapped, x_in, params, state):
+        return jax.lax.scan(layer_fn_wrapped, x_in, (params, state))
+
+      final_carry, scanned_state = nnx_decoder_scan(layer_fn_wrapped, x_in, params, state)
       returned_kv_stacked = None
 
       # Ensure metadata rank matches the stacked values
