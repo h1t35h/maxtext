@@ -1593,7 +1593,7 @@ class Qwen3DecoderLayer(AttentionWithNorm):
         if isinstance(inputs, tuple):
             inputs = inputs[0]
 
-        with jax.profiler.TraceAnnotation("attention_norm"):
+        with jax.named_scope("attention_norm"):
             hidden_states, intermediate_inputs, kv_cache = (
                 self.apply_attention_with_norm(
                     inputs,
@@ -1606,11 +1606,11 @@ class Qwen3DecoderLayer(AttentionWithNorm):
                 )
             )
 
-        with jax.profiler.TraceAnnotation("mlp_application"):
+        with jax.named_scope("mlp_application"):
             mlp_lnx = self.mlp(hidden_states, deterministic=deterministic)
             mlp_lnx = nn.with_logical_constraint(mlp_lnx, self.activation_axis_names)
 
-        with jax.profiler.TraceAnnotation("layer_output"):
+        with jax.named_scope("layer_output"):
             layer_output = intermediate_inputs + mlp_lnx
             layer_output = nn.with_logical_constraint(
                 layer_output, self.activation_axis_names
