@@ -144,31 +144,32 @@ def naive_jax_chunk_gated_delta_rule(
   xs = (query_scan, key_scan, value_scan, k_cumdecay_scan, g_scan, decay_mask_scan)
 
   def scan_body(prev_state, x):
-    q_i, k_i, v_i, k_cumdecay_i, g_i, decay_mask_i = x
-    last_recurrent_state = prev_state
-    prec = jax.lax.Precision.HIGHEST
-
-    attn_i = jnp.matmul(q_i, jnp.swapaxes(k_i, -1, -2), precision=prec) * decay_mask_i
-    attn_i = jnp.where(mask_inter, 0.0, attn_i)
-
-    v_prime = jnp.matmul(k_cumdecay_i, last_recurrent_state, precision=prec)
-    v_new = v_i - v_prime
-
-    g_i_exp = jnp.exp(g_i)
-    attn_inter = jnp.matmul(q_i * jnp.expand_dims(g_i_exp, -1), last_recurrent_state, precision=prec)
-
-    core_attn_out_i = attn_inter + jnp.matmul(attn_i, v_new, precision=prec)
-
-    g_i_last_exp = jnp.exp(g_i[..., -1, None, None])
-    new_last_recurrent_state = last_recurrent_state * g_i_last_exp
-
-    g_diff_exp = jnp.expand_dims(jnp.exp(jnp.expand_dims(g_i[..., -1], -1) - g_i), -1)
-    k_i_g_diff = k_i * g_diff_exp
-
-    update_term = jnp.matmul(jnp.swapaxes(k_i_g_diff, -1, -2), v_new, precision=prec)
-    new_last_recurrent_state = new_last_recurrent_state + update_term
-
-    return new_last_recurrent_state, core_attn_out_i
+    with jax.named_scope("naive_gdn_scan_body"):
+      q_i, k_i, v_i, k_cumdecay_i, g_i, decay_mask_i = x
+      last_recurrent_state = prev_state
+      prec = jax.lax.Precision.HIGHEST
+  
+      attn_i = jnp.matmul(q_i, jnp.swapaxes(k_i, -1, -2), precision=prec) * decay_mask_i
+      attn_i = jnp.where(mask_inter, 0.0, attn_i)
+  
+      v_prime = jnp.matmul(k_cumdecay_i, last_recurrent_state, precision=prec)
+      v_new = v_i - v_prime
+  
+      g_i_exp = jnp.exp(g_i)
+      attn_inter = jnp.matmul(q_i * jnp.expand_dims(g_i_exp, -1), last_recurrent_state, precision=prec)
+  
+      core_attn_out_i = attn_inter + jnp.matmul(attn_i, v_new, precision=prec)
+  
+      g_i_last_exp = jnp.exp(g_i[..., -1, None, None])
+      new_last_recurrent_state = last_recurrent_state * g_i_last_exp
+  
+      g_diff_exp = jnp.expand_dims(jnp.exp(jnp.expand_dims(g_i[..., -1], -1) - g_i), -1)
+      k_i_g_diff = k_i * g_diff_exp
+  
+      update_term = jnp.matmul(jnp.swapaxes(k_i_g_diff, -1, -2), v_new, precision=prec)
+      new_last_recurrent_state = new_last_recurrent_state + update_term
+  
+      return new_last_recurrent_state, core_attn_out_i
 
   final_state, core_attn_out_stacked = jax.lax.scan(scan_body, last_recurrent_state, xs)
 
@@ -299,50 +300,51 @@ def jax_chunk_gated_delta_rule(
   xs = (w_scan, u_scan, q_scan, k_scan, g_scan)
 
   def scan_body(h, args):
-    w, u, q, k, g = args
-    prec = jax.lax.Precision.HIGHEST
-
-    # --- Output Computation ---
-    # 1. Inter-chunk: q(dtype) * exp(g)(f32) -> f32
-    q_g = q.astype(jnp.float32) * jnp.exp(g)[..., None]
-    attn_inter = jnp.matmul(q_g, h, precision=prec)
-
-    # 2. Delta Rule Subtraction (v_prime and v_new)
-    # w serves as k_cumdecay, u serves as value_intra
-    v_prime = jnp.matmul(w.astype(jnp.float32), h, precision=prec)
-    v_new = u.astype(jnp.float32) - v_prime
-
-    # 3. Intra-chunk: q(dtype) @ k(dtype) -> f32
-    attn = jnp.matmul(q, k.swapaxes(-1, -2), precision=prec)
-    attn = attn.astype(jnp.float32)
-
-    # Mask before exp
-    g_diff = g[..., :, None] - g[..., None, :]
-    mask_intra = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=bool))
-    g_diff = jnp.where(mask_intra, g_diff, -1e30)
-
-    attn_i = attn * jnp.exp(g_diff)
-    attn_i = jnp.where(mask_intra, attn_i, 0.0)
-
-    # Note: We do NOT multiply attn_i by beta here. The Delta rule mathematically
-    # absorbed beta inside v_new (via u).
-
-    # 4. Combine Core Output
-    term2 = jnp.matmul(attn_i, v_new, precision=prec)
-    o_c = attn_inter + term2
-
-    # --- State Update ---
-    g_i_last_exp = jnp.exp(g[..., -1, None, None])
-    h_new = h * g_i_last_exp
-
-    # Apply Delta Rule K decay to state
-    g_diff_exp_state = jnp.exp(g[..., -1, None] - g)[..., None]
-    k_i_g_diff = k.astype(jnp.float32) * g_diff_exp_state
-
-    update_term = jnp.matmul(k_i_g_diff.swapaxes(-1, -2), v_new, precision=prec)
-    h_new = h_new + update_term
-
-    return h_new, o_c
+    with jax.named_scope("gdn_scan_body"):
+      w, u, q, k, g = args
+      prec = jax.lax.Precision.HIGHEST
+  
+      # --- Output Computation ---
+      # 1. Inter-chunk: q(dtype) * exp(g)(f32) -> f32
+      q_g = q.astype(jnp.float32) * jnp.exp(g)[..., None]
+      attn_inter = jnp.matmul(q_g, h, precision=prec)
+  
+      # 2. Delta Rule Subtraction (v_prime and v_new)
+      # w serves as k_cumdecay, u serves as value_intra
+      v_prime = jnp.matmul(w.astype(jnp.float32), h, precision=prec)
+      v_new = u.astype(jnp.float32) - v_prime
+  
+      # 3. Intra-chunk: q(dtype) @ k(dtype) -> f32
+      attn = jnp.matmul(q, k.swapaxes(-1, -2), precision=prec)
+      attn = attn.astype(jnp.float32)
+  
+      # Mask before exp
+      g_diff = g[..., :, None] - g[..., None, :]
+      mask_intra = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=bool))
+      g_diff = jnp.where(mask_intra, g_diff, -1e30)
+  
+      attn_i = attn * jnp.exp(g_diff)
+      attn_i = jnp.where(mask_intra, attn_i, 0.0)
+  
+      # Note: We do NOT multiply attn_i by beta here. The Delta rule mathematically
+      # absorbed beta inside v_new (via u).
+  
+      # 4. Combine Core Output
+      term2 = jnp.matmul(attn_i, v_new, precision=prec)
+      o_c = attn_inter + term2
+  
+      # --- State Update ---
+      g_i_last_exp = jnp.exp(g[..., -1, None, None])
+      h_new = h * g_i_last_exp
+  
+      # Apply Delta Rule K decay to state
+      g_diff_exp_state = jnp.exp(g[..., -1, None] - g)[..., None]
+      k_i_g_diff = k.astype(jnp.float32) * g_diff_exp_state
+  
+      update_term = jnp.matmul(k_i_g_diff.swapaxes(-1, -2), v_new, precision=prec)
+      h_new = h_new + update_term
+  
+      return h_new, o_c
 
   final_h, o_chunks = lax.scan(scan_body, h_init, xs)
 
@@ -566,6 +568,25 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     )
 
   def __call__(
+      self,
+      hidden_states: Array,
+      model_mode: str = MODEL_MODE_TRAIN,
+      kv_cache=None,
+      decoder_segment_ids: None | Array = None,
+      attention_metadata=None,
+      **kwargs,
+  ) -> tuple[Array, Any | None]:
+    with jax.named_scope("Qwen3NextGatedDeltaNet"):
+      return self._call_impl(
+          hidden_states,
+          model_mode,
+          kv_cache,
+          decoder_segment_ids,
+          attention_metadata,
+          **kwargs,
+      )
+
+  def _call_impl(
       self,
       hidden_states: Array,
       model_mode: str = MODEL_MODE_TRAIN,
@@ -1202,28 +1223,29 @@ class Qwen3NextScannableBlock(nnx.Module):
       A tuple containing the output of the block (the new carry) and an empty
       value for the scan's `y` collection.
     """
-    cfg = self.config
-    x = carry
-
-    # Loop over the number of sub-layers that make up one repeating pattern.
-    for i in range(cfg.inhomogeneous_layer_cycle_interval):
-      layer = getattr(self, f"layer_{i}")
-      # The second return value is kv_cache, which we ignore here because
-      # it is not passed as a carry in scannable layers.
-      x, _ = layer(
-          x,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          previous_chunk,
-          slot,
-          kv_cache=kv_cache,
-          attention_metadata=attention_metadata,
-      )
-
     # The output of the block is the carry for the next scan iteration.
-    return x, None
+    with jax.named_scope("qwen3_scannable_block"):
+      cfg = self.config
+      x = carry
+  
+      # Loop over the number of sub-layers that make up one repeating pattern.
+      for i in range(cfg.inhomogeneous_layer_cycle_interval):
+        layer = getattr(self, f"layer_{i}")
+        # The second return value is kv_cache, which we ignore here because
+        # it is not passed as a carry in scannable layers.
+        x, _ = layer(
+            x,
+            decoder_segment_ids,
+            decoder_positions,
+            deterministic,
+            model_mode,
+            previous_chunk,
+            slot,
+            kv_cache=kv_cache,
+            attention_metadata=attention_metadata,
+        )
+  
+      return x, None
 
 
 class Qwen3NextDecoderLayer(nnx.Module):
@@ -1297,6 +1319,31 @@ class Qwen3NextDecoderLayer(nnx.Module):
     self.mlp = Qwen3NextSparseMoeBlock(config=cfg, mesh=self.mesh, quant=self.quant, rngs=rngs)
 
   def __call__(
+      self,
+      inputs: jnp.ndarray,
+      decoder_segment_ids: None | jnp.ndarray,
+      decoder_positions: None | jnp.ndarray,
+      deterministic: bool,
+      model_mode: str,
+      previous_chunk=None,
+      slot: None | int = None,
+      kv_cache: None | dict[str, Array] = None,
+      attention_metadata: None | dict[str, Any] = None,
+  ):
+    with jax.named_scope(f"Qwen3NextDecoderLayer_{self.layer_idx}"):
+      return self._call_impl(
+          inputs,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          previous_chunk,
+          slot,
+          kv_cache,
+          attention_metadata,
+      )
+
+  def _call_impl(
       self,
       inputs: jnp.ndarray,
       decoder_segment_ids: None | jnp.ndarray,
