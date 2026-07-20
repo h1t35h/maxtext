@@ -575,6 +575,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         rngs=rngs,
     )
 
+  @jax.named_call
   def __call__(
       self,
       hidden_states: Array,
@@ -584,7 +585,6 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       attention_metadata=None,
       **kwargs,
   ) -> tuple[Array, Any | None]:
-    with jax.named_scope("Qwen3NextGatedDeltaNet"):
       return self._call_impl(
           hidden_states,
           model_mode,
@@ -1060,6 +1060,7 @@ class Qwen3NextFullAttention(nnx.Module):
         rngs=rngs,
     )
 
+  @jax.named_call
   def __call__(
       self,
       inputs: jnp.ndarray,
@@ -1070,7 +1071,6 @@ class Qwen3NextFullAttention(nnx.Module):
       kv_cache: None | jnp.ndarray = None,
       attention_metadata: None | dict[str, Any] = None,
   ):
-    with jax.named_scope("Qwen3NextFullAttention"):
       attention_output, kv_cache = self.attention(
           inputs_q=inputs,
           inputs_kv=inputs,
@@ -1145,6 +1145,7 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
         rngs=rngs,
     )
 
+  @jax.named_call
   def __call__(self, hidden_states: Array, deterministic: bool) -> tuple[Array, Array | None]:
     """
     Applies the sparse MoE block to the input hidden states.
@@ -1158,20 +1159,19 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
         - The output array of the MoE block.
         - The load balancing loss from the routed experts, if applicable during training.
     """
-    with jax.named_scope("Qwen3NextSparseMoeBlock"):
-      # 1. Apply the routed experts block.
-      routed_output, load_balance_loss, _ = self.routed_experts(hidden_states)
-  
-      # 2. Apply the shared expert.
-      shared_expert_output = self.shared_expert(hidden_states, deterministic=deterministic)
-  
-      # 3. Apply the gate for the shared expert.
-      shared_gate_output = self.shared_expert_gate(hidden_states)
-  
-      # 4. Combine the outputs.
-      final_output = routed_output + jax.nn.sigmoid(shared_gate_output) * shared_expert_output
-  
-      return final_output, load_balance_loss
+    # 1. Apply the routed experts block.
+    routed_output, load_balance_loss, _ = self.routed_experts(hidden_states)
+
+    # 2. Apply the shared expert.
+    shared_expert_output = self.shared_expert(hidden_states, deterministic=deterministic)
+
+    # 3. Apply the gate for the shared expert.
+    shared_gate_output = self.shared_expert_gate(hidden_states)
+
+    # 4. Combine the outputs.
+    final_output = routed_output + jax.nn.sigmoid(shared_gate_output) * shared_expert_output
+
+    return final_output, load_balance_loss
 
 
 class Qwen3NextScannableBlock(nnx.Module):
@@ -1329,6 +1329,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
     # Instantiate our `Qwen3NextSparseMoeBlock`.
     self.mlp = Qwen3NextSparseMoeBlock(config=cfg, mesh=self.mesh, quant=self.quant, rngs=rngs)
 
+  @jax.named_call
   def __call__(
       self,
       inputs: jnp.ndarray,
@@ -1341,7 +1342,6 @@ class Qwen3NextDecoderLayer(nnx.Module):
       kv_cache: None | dict[str, Array] = None,
       attention_metadata: None | dict[str, Any] = None,
   ):
-    with jax.named_scope(f"Qwen3NextDecoderLayer_{self.layer_idx}"):
       return self._call_impl(
           inputs,
           decoder_segment_ids,
@@ -1495,6 +1495,7 @@ class AttentionWithNorm(nnx.Module):
         rngs=rngs,
     )
 
+  @jax.named_call
   def apply_attention_with_norm(
       self,
       inputs: jnp.ndarray,
@@ -1506,30 +1507,29 @@ class AttentionWithNorm(nnx.Module):
       attention_metadata: None | dict[str, Any] = None,
   ):
     """Applies self-attention with pre and post-layer normalization."""
-    with jax.named_scope("apply_attention_with_norm"):
-      inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
-      inputs = checkpoint_name(inputs, "decoder_layer_input")
-      # Pre attention norm
-      lnx = self.pre_self_attention_layer_norm(inputs)
-      lnx = nn.with_logical_constraint(lnx, self.activation_axis_names)
-      # Self attention
-      attention_lnx, kv_cache = self.self_attention(
-          lnx,
-          lnx,
-          decoder_positions,
-          decoder_segment_ids=decoder_segment_ids,
-          deterministic=deterministic,
-          model_mode=model_mode,
-          kv_cache=kv_cache,
-          attention_metadata=attention_metadata,
-      )
-      attention_lnx = nn.with_logical_constraint(attention_lnx, self.activation_axis_names)
-      # Residual connection after attention
-      intermediate_inputs = inputs + attention_lnx
-      # Post attention norm
-      hidden_states = self.post_self_attention_layer_norm(intermediate_inputs)
-      hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
-      return hidden_states, intermediate_inputs, kv_cache
+    inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
+    inputs = checkpoint_name(inputs, "decoder_layer_input")
+    # Pre attention norm
+    lnx = self.pre_self_attention_layer_norm(inputs)
+    lnx = nn.with_logical_constraint(lnx, self.activation_axis_names)
+    # Self attention
+    attention_lnx, kv_cache = self.self_attention(
+        lnx,
+        lnx,
+        decoder_positions,
+        decoder_segment_ids=decoder_segment_ids,
+        deterministic=deterministic,
+        model_mode=model_mode,
+        kv_cache=kv_cache,
+        attention_metadata=attention_metadata,
+    )
+    attention_lnx = nn.with_logical_constraint(attention_lnx, self.activation_axis_names)
+    # Residual connection after attention
+    intermediate_inputs = inputs + attention_lnx
+    # Post attention norm
+    hidden_states = self.post_self_attention_layer_norm(intermediate_inputs)
+    hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
+    return hidden_states, intermediate_inputs, kv_cache
 
 
 # -----------------------------------------
@@ -1561,6 +1561,7 @@ class Qwen3DecoderLayer(AttentionWithNorm):
         rngs=rngs,
     )
 
+  @jax.named_call
   def __call__(
       self,
       inputs: jnp.ndarray,
@@ -1573,7 +1574,6 @@ class Qwen3DecoderLayer(AttentionWithNorm):
       kv_cache: None | jnp.ndarray = None,
       attention_metadata: None | dict[str, Any] = None,
   ):
-    with jax.named_scope("Qwen3DecoderLayer"):
       # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
       if isinstance(inputs, tuple):
         inputs = inputs[0]
@@ -1625,6 +1625,7 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
         rngs=rngs,
     )
 
+  @jax.named_call
   def __call__(
       self,
       inputs: jnp.ndarray,
@@ -1637,7 +1638,6 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
       kv_cache: None | jnp.ndarray = None,
       attention_metadata: None | dict[str, Any] = None,
   ):
-    with jax.named_scope("Qwen3MoeDecoderLayer"):
       # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
       is_scan_carry = False
       if isinstance(inputs, tuple) and len(inputs) == 3:
