@@ -1577,7 +1577,7 @@ class Qwen3DecoderLayer(AttentionWithNorm):
             model_mode=model_mode,
             rngs=rngs,
         )
-    def __call__(
+    def Qwen3DecoderLayer(
         self,
         inputs: jnp.ndarray,
         decoder_segment_ids: None | jnp.ndarray,
@@ -1618,6 +1618,7 @@ class Qwen3DecoderLayer(AttentionWithNorm):
 
         return layer_output, kv_cache
 
+    __call__ = Qwen3DecoderLayer
 
 # -----------------------------------------
 # The MoE Decoder Layer for Qwen3
@@ -1648,7 +1649,7 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
         rngs=rngs,
     )
 
-    def __call__(
+    def Qwen3MoeDecoderLayer(
       self,
       inputs: jnp.ndarray,
       decoder_segment_ids: None | jnp.ndarray,
@@ -1660,7 +1661,7 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
       kv_cache: None | jnp.ndarray = None,
       attention_metadata: None | dict[str, Any] = None,
   ):
-        with jax.profiler.TraceAnnotation("Qwen3DecoderLayerWithMoe"):
+        with jax.named_scope("Qwen3DecoderLayerWithMoe"):
             # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
             is_scan_carry = False
             if isinstance(inputs, tuple) and len(inputs) == 3:
@@ -1711,6 +1712,7 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
             else:
                 return layer_output, kv_cache
 
+    __call__ = Qwen3MoeDecoderLayer
 
 class Qwen3OmniMoeVisionPatchMerger(nnx.Module):
   """Vision patch merger that spatially merges patches using an MLP.
