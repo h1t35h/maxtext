@@ -584,7 +584,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       attention_metadata=None,
       **kwargs,
   ) -> tuple[Array, Any | None]:
-        with jax.profiler.TraceAnnotation("Qwen3NextGatedDeltaNet"):
+        with jax.named_scope("Qwen3NextGatedDeltaNet"):
             return self._call_impl(
                 hidden_states,
                 model_mode,
@@ -1070,7 +1070,7 @@ class Qwen3NextFullAttention(nnx.Module):
       kv_cache: None | jnp.ndarray = None,
       attention_metadata: None | dict[str, Any] = None,
   ):
-        with jax.profiler.TraceAnnotation("Attention"):
+        with jax.named_scope("Attention"):
             attention_output, kv_cache = self.attention(
                 inputs_q=inputs,
                 inputs_kv=inputs,
@@ -1158,7 +1158,7 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
         - The output array of the MoE block.
         - The load balancing loss from the routed experts, if applicable during training.
     """
-        with jax.profiler.TraceAnnotation("Qwen3NextSparseMoeBlock"):
+        with jax.named_scope("Qwen3NextSparseMoeBlock"):
             # 1. Apply the routed experts block.
             routed_output, load_balance_loss, _ = self.routed_experts(hidden_states)
 
@@ -1348,7 +1348,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
         kv_cache: None | dict[str, Array] = None,
         attention_metadata: None | dict[str, Any] = None,
     ):
-        with jax.profiler.TraceAnnotation("Qwen3NextDecoderLayer"):
+        with jax.named_scope("Qwen3NextDecoderLayer"):
             return self._call_impl(
                 inputs,
                 decoder_segment_ids,
@@ -1520,11 +1520,11 @@ class AttentionWithNorm(nnx.Module):
         inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
         inputs = checkpoint_name(inputs, "decoder_layer_input")
         # Pre attention norm
-        with jax.profiler.TraceAnnotation("pre_self_attention"):
+        with jax.named_scope("pre_self_attention"):
             lnx = self.pre_self_attention_layer_norm(inputs)
             lnx = nn.with_logical_constraint(lnx, self.activation_axis_names)
         # Self attention
-        with jax.profiler.TraceAnnotation("self_attention"):
+        with jax.named_scope("self_attention"):
             attention_lnx, kv_cache = self.self_attention(
                 lnx,
                 lnx,
@@ -1540,7 +1540,7 @@ class AttentionWithNorm(nnx.Module):
         )
         # Residual connection after attention
         intermediate_inputs = inputs + attention_lnx
-        with jax.profiler.TraceAnnotation("post_self_attention"):
+        with jax.named_scope("post_self_attention"):
             # Post attention norm
             hidden_states = self.post_self_attention_layer_norm(intermediate_inputs)
         hidden_states = nn.with_logical_constraint(
@@ -1577,6 +1577,8 @@ class Qwen3DecoderLayer(AttentionWithNorm):
             model_mode=model_mode,
             rngs=rngs,
         )
+
+    @jax.named_call(name="qwen3DecoderLayer")
     def Qwen3DecoderLayer(
         self,
         inputs: jnp.ndarray,
