@@ -1770,7 +1770,7 @@ class Qwen3DecoderLayer(AttentionWithNorm):
             rngs=rngs,
         )
 
-    @functools.partial(jax.named_call, name="Qwen3DecoderLayer")
+    @functools.partial(jax.named_call, name="qwen3_decoder_layer")
     def Qwen3DecoderLayer(
         self,
         inputs: jnp.ndarray,
