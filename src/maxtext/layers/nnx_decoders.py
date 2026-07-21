@@ -1593,7 +1593,8 @@ class NNXDecoder(nnx.Module):
                 logits = logits / cfg.final_logits_soft_cap
                 logits = jnp.tanh(logits) * cfg.final_logits_soft_cap
         else:
-            logits = self.logits_dense(y, out_sharding=out_sharding)
+            with jax.named_scope("dense_logits"):
+                logits = self.logits_dense(y, out_sharding=out_sharding)
 
         if self.config.cast_logits_to_fp32:
             logits = logits.astype(jnp.float32)
