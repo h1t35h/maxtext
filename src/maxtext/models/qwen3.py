@@ -211,10 +211,12 @@ def invert_unit_lower_triangular_log_depth(S):
         
     return A
 
+@functools.partial(jax.named_call, name="invert_triangular_fwd")
 def _invert_unit_lower_triangular_log_depth_fwd(S):
     A = invert_unit_lower_triangular_log_depth(S)
     return A, A
 
+@functools.partial(jax.named_call, name="invert_triangular_bwd")
 def _invert_unit_lower_triangular_log_depth_bwd(res, g):
     A = res
     grad_S = jnp.tril(- (A.mT @ g @ A.mT), k=-1)
