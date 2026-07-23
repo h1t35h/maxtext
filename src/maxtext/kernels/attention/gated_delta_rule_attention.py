@@ -388,6 +388,7 @@ def gdn_backward_kernel_tpu(
 # ==============================================================================
 # 3. Custom VJP Registration & Wrappers
 # ==============================================================================
+@functools.partial(jax.named_call, name="gdn_pallas_fwd")
 def _gdn_pallas_forward(w, u, q, k, v, g, beta, h_init):
   """Performs the forward pass of the Gated Delta Network using a Pallas kernel."""
   batch_size, num_heads, num_chunks, chunk_size, k_dim = k.shape
@@ -450,6 +451,7 @@ def _gdn_pallas_forward(w, u, q, k, v, g, beta, h_init):
   return (out, h_final), (w, u, q, k, v, g, beta, h_init)
 
 
+@functools.partial(jax.named_call, name="gdn_pallas_bwd")
 def _gdn_pallas_backward(residuals, grad_out_tuple):
   """Performs the backward pass for the Gated Delta Network using a Pallas kernel."""
   grad_out, grad_h_final = grad_out_tuple

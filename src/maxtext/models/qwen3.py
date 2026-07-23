@@ -850,18 +850,19 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
           compute_dtype=cfg.dtype,
       )
     elif self.mesh is not None:
-      core_attn_out, next_recurrent_state = pallas_chunk_gated_delta_rule(
-          query=query,
-          key=key,
-          value=value,
-          g=g,
-          beta=beta,
-          chunk_size=cfg.gdn_chunk_size,
-          initial_state=recurrent_state,
-          use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn,
-          compute_dtype=cfg.dtype,
-          mesh=self.mesh,
-      )
+      with jax.named_scope("pallas_chunk_gated_delta_rule_kernel"):
+        core_attn_out, next_recurrent_state = pallas_chunk_gated_delta_rule(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            chunk_size=cfg.gdn_chunk_size,
+            initial_state=recurrent_state,
+            use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn,
+            compute_dtype=cfg.dtype,
+            mesh=self.mesh,
+        )
     elif self.mesh is not None:
       logical_rules = self.config.logical_axis_rules
       recurrent_state_arg = (
