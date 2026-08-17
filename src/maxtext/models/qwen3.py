@@ -170,7 +170,7 @@ def naive_jax_chunk_gated_delta_rule(
 
     return new_last_recurrent_state, core_attn_out_i
 
-  final_state, core_attn_out_stacked = jax.lax.scan(scan_body, last_recurrent_state, xs, unroll=0)
+  final_state, core_attn_out_stacked = jax.lax.scan(scan_body, last_recurrent_state, xs)
 
   core_attn_out = jnp.transpose(core_attn_out_stacked, (1, 2, 0, 3, 4))
   core_attn_out = core_attn_out.reshape(batch_size, num_heads, -1, v_head_dim)
@@ -180,34 +180,64 @@ def naive_jax_chunk_gated_delta_rule(
   return core_attn_out, final_state if output_final_state else None
 
 
+@functools.lru_cache(maxsize=None)
+def _block_offdiagonal_masks(chunk_size: int) -> tuple[Array, ...]:
+  """Static masks used by the log-depth blocked triangular inversion.
+
+  Mask `i` selects, for every 2b x 2b diagonal block (b = 2**i), the strictly
+  lower-left b x b sub-block. Masks are compile-time constants, so building
+  them with jnp costs nothing at run time.
+  """
+  idx = jnp.arange(chunk_size)
+  masks = []
+  block = 1
+  while block < chunk_size:
+    row_block = idx[:, None] // block
+    col_block = idx[None, :] // block
+    masks.append((row_block == col_block + 1) & (row_block % 2 == 1))
+    block *= 2
+  return tuple(masks)
+
+
 @jax.custom_vjp
 def invert_unit_lower_triangular_log_depth(S):
-  """
-  Computes (I + S)^-1 for a strictly lower triangular matrix S
-  using log-depth Newton-Schulz iterations.
+  """Computes (I + S)^-1 for a strictly lower triangular matrix S.
 
-  This is highly optimized for TPUs/GPUs and replaces
-  jax.scipy.linalg.solve_triangular for chunkwise linear attention.
+  Uses the log-depth blocked (divide-and-conquer) triangular inverse: at each
+  of the ceil(log2(chunk_size)) levels the inverses of two adjacent b x b
+  diagonal blocks are merged into the inverse of the enclosing 2b x 2b block
+  via the Schur-complement identity
+
+      [[P, 0], [Q, R]]^-1 = [[P^-1, 0], [-R^-1 Q P^-1, R^-1]]
+
+  which is expressed batch-wide as `A <- A - A @ (mask * S) @ A`.
+
+  This replaces jax.scipy.linalg.solve_triangular for chunkwise linear
+  attention: same log depth and matmul count as a Neumann/Newton-Schulz power
+  iteration, but every intermediate is an actual sub-block inverse, so the
+  magnitudes stay bounded by the conditioning of (I + S) itself. A power
+  iteration instead materialises S^2, S^4, ... S^(2^k), whose entries can reach
+  1e17 at chunk_size=64 (and overflow f32 at 256) for strongly correlated keys
+  even though the true inverse is O(1) -- the cancellation destroys the result
+  in float32 long before it overflows.
   """
   chunk_size = S.shape[-1]
+  prec = jax.lax.Precision.HIGHEST
 
-  # Ensure S is strictly lower triangular (zero out diagonal and upper half)
-  # This guarantees mathematical correctness and stability
+  # Ensure S is strictly lower triangular (zero out diagonal and upper half).
   S_strict = jnp.tril(S, k=-1)
+  masks = _block_offdiagonal_masks(chunk_size)
+  if not masks:  # chunk_size == 1
+    return jnp.ones_like(S)
 
-  # Base identity matrix
-  identity = jnp.eye(chunk_size, dtype=S.dtype)
+  # Level 0 in closed form: the inverse of the 2x2 diagonal blocks is
+  # I - (first subdiagonal), so it needs no matmul.
+  A = jnp.eye(chunk_size, dtype=S.dtype) - jnp.where(masks[0], S_strict, 0.0)
 
-  # Initial approximation and error term
-  A = identity - S_strict
-  E = jnp.tril(S_strict @ S_strict, k=-1)
-
-  # Log-depth Taylor series exact computation
-  steps = int(math.ceil(math.log2(chunk_size)))
-  for _ in range(steps - 1):
-    # Update inverse and error using batched matmuls
-    A = jnp.tril(A + A @ E)
-    E = jnp.tril(E @ E, k=-1)
+  for mask in masks[1:]:
+    # Off-diagonal coupling between the two halves of each diagonal block.
+    E = jnp.where(mask, S_strict, 0.0)
+    A = jnp.tril(A - jnp.matmul(jnp.matmul(A, E, precision=prec), A, precision=prec))
 
   return A
 
@@ -220,8 +250,11 @@ def _invert_unit_lower_triangular_log_depth_fwd(S):
 
 @functools.partial(jax.named_call, name="invert_triangular_bwd")
 def _invert_unit_lower_triangular_log_depth_bwd(res, g):
+  # A = (I + S)^-1  =>  dA = -A dS A  =>  grad_S = -A^T g A^T, masked to the
+  # strictly lower triangle (the only entries S actually has).
   A = res
-  grad_S = jnp.tril(-(A.mT @ g @ A.mT), k=-1)
+  prec = jax.lax.Precision.HIGHEST
+  grad_S = jnp.tril(-jnp.matmul(jnp.matmul(A.mT, g, precision=prec), A.mT, precision=prec), k=-1)
   return (grad_S,)
 
 
@@ -315,10 +348,7 @@ def jax_chunk_gated_delta_rule(
   S = S * jnp.exp(g_diff)
   S = jnp.where(mask, S, 0.0)
 
-  # Cast to float32 explicitly as you were doing before
-  S = S.astype(jnp.float32)
-
-  # Inversion (A) - Replaces solve_triangular entirely
+  # Inversion (A) - replaces solve_triangular entirely. S is already float32.
   A = invert_unit_lower_triangular_log_depth(S)
 
   # 5. WY Factors

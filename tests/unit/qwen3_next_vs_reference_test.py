@@ -21,6 +21,7 @@ import unittest
 from flax import nnx
 import jax
 import jax.numpy as jnp
+from jax.experimental import enable_x64
 from jax.sharding import Mesh
 from jax.test_util import check_grads
 from maxtext.configs import pyconfig
@@ -1038,39 +1039,145 @@ class TestQwen3Next(unittest.TestCase):
     )
     print("test_qwen3_next_sparse_moe_block passed!")
 
-  def test_invert_unit_lower_triangular_log_depth(self):
-    """Test for loss at chunk_size 256."""
-    jax.config.update("jax_enable_x64", True)  # Use float64 for precise testing
-    chunk_size = 256
+  @staticmethod
+  def _make_gdn_s_matrix(chunk_size, cos_sim, key_dim=32, beta_mode="sigmoid", decay=0.02, seed=0):
+    """Builds an S matrix with the same structure the chunked delta rule produces.
 
-    # Generate a random matrix and make it strictly lower triangular
-    key = jax.random.PRNGKey(chunk_size)
-    S_random = jax.random.normal(key, (chunk_size, chunk_size), dtype=jnp.float64) / chunk_size
-    S = jnp.tril(S_random, k=-1)
+    `S[i, j] = beta_i * <k_i, k_j> * exp(g_cumsum_i - g_cumsum_j)` for i > j, with
+    l2-normalised keys whose average pairwise cosine similarity is `cos_sim`.
+    `cos_sim=0` is the benign well-spread case; `cos_sim -> 1` is the degenerate
+    "all tokens look alike" case that makes (I + S) as ill-conditioned as the
+    delta rule can make it.
+    """
+    rng = np.random.default_rng(seed)
+    shared = rng.standard_normal((1, key_dim))
+    shared /= np.linalg.norm(shared, axis=-1, keepdims=True)
+    noise = rng.standard_normal((chunk_size, key_dim))
+    noise /= np.linalg.norm(noise, axis=-1, keepdims=True)
+    k = np.sqrt(cos_sim) * shared + np.sqrt(1.0 - cos_sim) * noise
+    k /= np.linalg.norm(k, axis=-1, keepdims=True)
 
-    # The matrix to invert is (I + S)
-    identity = jnp.eye(chunk_size, dtype=jnp.float64)
-    matrix_to_invert = identity + S
+    # Qwen3-Next computes beta as sigmoid(.), so it lives in (0, 1).
+    beta = 1.0 / (1.0 + np.exp(-rng.standard_normal(chunk_size))) if beta_mode == "sigmoid" else np.ones(chunk_size)
+    g_cumsum = np.cumsum(-decay * rng.random(chunk_size))
 
-    # Using our custom function
-    A = qwen3.invert_unit_lower_triangular_log_depth(S)
+    s = beta[:, None] * (k @ k.T) * np.exp(g_cumsum[:, None] - g_cumsum[None, :])
+    return jnp.asarray(np.tril(s, -1), dtype=jnp.float32)
 
-    # The product A @ (I + S) should be exactly the identity matrix
-    # Wait, due to numerical precision, we should check for max error (loss)
-    reconstructed_identity = A @ matrix_to_invert
+  def test_invert_unit_lower_triangular_float32_accuracy(self):
+    """(I + S)^-1 must stay accurate in float32 for ill-conditioned, realistic S.
 
-    # Compute loss for forward pass
-    loss = jnp.max(jnp.abs(reconstructed_identity - identity))
+    Regression guard for the numerics of the inversion: a Neumann/Newton-Schulz
+    power iteration (I - S + S^2 - S^4 ...) blows the intermediates up to ~1e17 at
+    chunk_size=64 and overflows float32 at 256 whenever the keys inside a chunk are
+    strongly correlated, even though the true inverse stays O(1). Random S with
+    ||S|| ~ 0.1 does not exercise that, so we sweep the correlation explicitly.
+    """
+    print("Running test_invert_unit_lower_triangular_float32_accuracy...")
+    for chunk_size in (32, 64, 128, 256):
+      for cos_sim, beta_mode in ((0.0, "sigmoid"), (0.5, "sigmoid"), (0.9, "sigmoid"), (0.99, "ones")):
+        with self.subTest(chunk_size=chunk_size, cos_sim=cos_sim, beta_mode=beta_mode):
+          s = self._make_gdn_s_matrix(chunk_size, cos_sim, beta_mode=beta_mode)
+          identity = jnp.eye(chunk_size, dtype=jnp.float32)
 
-    # We expect the loss to be very small, around numerical precision
-    self.assertLess(loss, 1e-10, f"Failed for chunk_size {chunk_size} with loss {loss}")
+          a = qwen3.invert_unit_lower_triangular_log_depth(s)
 
-    # Verify backward pass accuracy using jax.test_util.check_grads
-    # This uses finite differences to check the correctness of the custom VJP
-    # We check the gradients for the function.
-    # `check_grads` will assert if finite difference gradients
-    # don't match the custom VJP gradients.
-    check_grads(qwen3.invert_unit_lower_triangular_log_depth, (S,), order=1, modes=["rev"])
+          # Reference: exact inverse computed in float64 on the host.
+          a_ref = np.linalg.inv(np.eye(chunk_size) + np.asarray(s, dtype=np.float64))
+          self.assertTrue(bool(jnp.all(jnp.isfinite(a))), "inverse contains inf/nan")
+          np.testing.assert_allclose(np.asarray(a, dtype=np.float64), a_ref, atol=2e-4, rtol=2e-4)
+
+          # And the defining property, which no amount of reference drift excuses.
+          residual = jnp.max(jnp.abs(a @ (identity + s) - identity))
+          self.assertLess(
+              float(residual),
+              1e-4,
+              f"||A(I+S) - I||_max = {residual} for chunk_size={chunk_size}, cos_sim={cos_sim}",
+          )
+
+    # Fully degenerate case: identical keys, beta = 1, no decay. (I + S)^-1 is then
+    # exactly I minus the first subdiagonal, so any growth in the intermediates is
+    # pure cancellation error.
+    for chunk_size in (64, 128, 256):
+      with self.subTest(case="identical_keys", chunk_size=chunk_size):
+        s = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.float32), -1)
+        expected = jnp.eye(chunk_size, dtype=jnp.float32) - jnp.eye(chunk_size, k=-1, dtype=jnp.float32)
+        np.testing.assert_allclose(
+            np.asarray(qwen3.invert_unit_lower_triangular_log_depth(s)), np.asarray(expected), atol=1e-5
+        )
+    print("test_invert_unit_lower_triangular_float32_accuracy passed!")
+
+  def test_invert_unit_lower_triangular_custom_vjp(self):
+    """The custom VJP must match finite differences (checked in float64)."""
+    print("Running test_invert_unit_lower_triangular_custom_vjp...")
+    chunk_size = 64
+    with enable_x64():
+      s = jnp.asarray(self._make_gdn_s_matrix(chunk_size, cos_sim=0.5), dtype=jnp.float64)
+      # `check_grads` asserts if the finite-difference gradients disagree with the
+      # gradients produced by _invert_unit_lower_triangular_log_depth_bwd.
+      check_grads(qwen3.invert_unit_lower_triangular_log_depth, (s,), order=1, modes=["rev"])
+    print("test_invert_unit_lower_triangular_custom_vjp passed!")
+
+  def test_chunk_gated_delta_rule_correlated_keys(self):
+    """End-to-end delta-rule check on the inputs that stress the chunk inversion.
+
+    `test_chunk_gated_delta_rule_logic` uses N(0, 0.1) keys, which keep S tiny. This
+    drives the same comparison against the PyTorch reference with near-duplicate keys
+    inside every chunk, which is what makes (I + S) hard to invert.
+    """
+    print("Running test_chunk_gated_delta_rule_correlated_keys...")
+    num_heads = self.cfg.gdn_num_value_heads
+    k_head_dim = self.cfg.gdn_key_head_dim
+    v_head_dim = self.cfg.gdn_value_head_dim
+
+    rng = np.random.default_rng(0)
+    shape = (self.batch_size, self.seq_len, num_heads, k_head_dim)
+    # Keys sharing a dominant direction per (batch, head) => high intra-chunk cosine
+    # similarity after the l2 norm inside the kernel.
+    shared = rng.standard_normal((self.batch_size, 1, num_heads, k_head_dim))
+    k_np = (3.0 * shared + rng.standard_normal(shape)).astype(np.float32)
+    q_np = (3.0 * shared + rng.standard_normal(shape)).astype(np.float32)
+    v_np = rng.standard_normal((self.batch_size, self.seq_len, num_heads, v_head_dim)).astype(np.float32)
+    # beta = sigmoid(.) in the layer; sample it near 1 to maximise ||S||.
+    beta_np = (1.0 / (1.0 + np.exp(-(2.0 + rng.standard_normal((self.batch_size, self.seq_len, num_heads)))))).astype(
+        np.float32
+    )
+    # Near-zero decay, so nothing damps the intra-chunk interactions.
+    g_np = (-0.01 * rng.random((self.batch_size, self.seq_len, num_heads))).astype(np.float32)
+
+    for chunk_size in (64, 128):
+      with self.subTest(chunk_size=chunk_size):
+        torch_output, _ = torch_chunk_gated_delta_rule(
+            torch.from_numpy(q_np.copy()),
+            torch.from_numpy(k_np.copy()),
+            torch.from_numpy(v_np.copy()),
+            torch.from_numpy(g_np.copy()),
+            torch.from_numpy(beta_np.copy()),
+            chunk_size=chunk_size,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        jax_output, _ = qwen3.jax_chunk_gated_delta_rule(
+            jnp.asarray(q_np),
+            jnp.asarray(k_np),
+            jnp.asarray(v_np),
+            jnp.asarray(g_np),
+            jnp.asarray(beta_np),
+            chunk_size=chunk_size,
+            initial_state=None,
+            use_qk_norm_in_gdn=True,
+            compute_dtype=jnp.float32,
+        )
+        np.testing.assert_allclose(
+            torch_output.detach().numpy(),
+            np.asarray(jax_output),
+            # Loose enough for float32 on an ill-conditioned (I + S); the failure
+            # mode this guards against is off by O(1) or more.
+            atol=1e-3,
+            rtol=1e-3,
+            err_msg=f"JAX and PyTorch delta-rule outputs diverge on correlated keys (chunk_size={chunk_size})",
+        )
+    print("test_chunk_gated_delta_rule_correlated_keys passed!")
 
   def test_gated_delta_net_full(self):
     """Tests the full Qwen3NextGatedDeltaNet layer for numerical correctness."""
