@@ -16,6 +16,7 @@
 """Tests for Attentions."""
 
 import itertools
+import math
 import os
 import random
 import sys
@@ -6564,6 +6565,589 @@ class KVHeadShardingTest(parameterized.TestCase):
     self._set_mesh_shape(context=2)
     with self._use_ulysses():
       self.attention._validate_kv_head_sharding(self._KV_KERNEL_AXES)  # pylint: disable=protected-access
+
+
+class MLAAbsorbedMQATest(attention_test_util.MLATestBase):
+  """Comprehensive unit test suite for Absorbed-Query Latent MQA (PR 1 / Milestone 2)."""
+
+  config_arguments = {
+      "per_device_batch_size": 1.0,
+      "run_name": "test_mla_absorbed_mqa",
+      "enable_checkpointing": False,
+      "max_target_length": 32,
+      "max_prefill_predict_length": 16,
+      "attention_type": AttentionType.MLA.value,
+      "head_dim": 256,
+      "q_lora_rank": 0,
+      "kv_lora_rank": 512,
+      "qk_nope_head_dim": 192,
+      "qk_rope_head_dim": 64,
+      "v_head_dim": 256,
+      "num_query_heads": 64,
+      "num_kv_heads": 64,
+      "attention": "dot_product",
+      "dtype": "float32",
+      "mla_naive_kvcache": False,
+  }
+
+  def test_mla_absorbed_mqa_parity(self):
+    """Verifies numerical parity between dense MLA and Absorbed-Query Latent MQA in FP32 and BF16."""
+    # 1. FP32 Full Layer Forward Pass Parity
+    cfg_fp32, mla_dense = self.init_mla(self.config_arguments, rope_type="default")
+    cfg_fp32_mqa = self.config_arguments.copy()
+    cfg_fp32_mqa["use_mla_absorbed_mqa"] = True
+    _, mla_mqa = self.init_mla(cfg_fp32_mqa, rope_type="default")
+
+    nnx.update(mla_mqa, nnx.state(mla_dense))
+
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg_fp32, "float32")
+    out_dense, _ = mla_dense(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    out_mqa, _ = mla_mqa(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    max_diff_fp32 = float(jnp.max(jnp.abs(out_dense - out_mqa)))
+    self.assertLessEqual(max_diff_fp32, 1e-5, f"FP32 parity failed: {max_diff_fp32} > 1e-5")
+
+    # 2. BF16 Parity Verification on Real Modules (catching D5)
+    cfg_bf16_args = self.config_arguments.copy()
+    cfg_bf16_args["dtype"] = "bfloat16"
+    cfg_bf16_args["weight_dtype"] = "bfloat16"
+    cfg_bf16_dense, mla_dense_bf16 = self.init_mla(cfg_bf16_args, rope_type="default")
+
+    cfg_bf16_mqa_args = cfg_bf16_args.copy()
+    cfg_bf16_mqa_args["use_mla_absorbed_mqa"] = True
+    _, mla_mqa_bf16 = self.init_mla(cfg_bf16_mqa_args, rope_type="default")
+    nnx.update(mla_mqa_bf16, nnx.state(mla_dense_bf16))
+
+    lnx_bf16, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg_bf16_dense, "bfloat16")
+    out_dense_bf16, _ = mla_dense_bf16(
+        lnx_bf16,
+        lnx_bf16,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    out_mqa_bf16, _ = mla_mqa_bf16(
+        lnx_bf16,
+        lnx_bf16,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    max_diff_bf16 = float(jnp.max(jnp.abs(out_dense_bf16.astype(jnp.float32) - out_mqa_bf16.astype(jnp.float32))))
+    self.assertLessEqual(max_diff_bf16, 5e-2, f"BF16 parity failed: {max_diff_bf16} > 5e-2")
+
+  def test_mla_absorbed_mqa_kv_cache_footprint(self):
+    """Verifies the exact 57x reduction in KV cache memory footprint on real production modules (catching D3)."""
+    cfg_dense, mla_dense = self.init_mla(self.config_arguments, rope_type="default")
+    cfg_mqa_args = self.config_arguments.copy()
+    cfg_mqa_args["use_mla_absorbed_mqa"] = True
+    _, mla_mqa = self.init_mla(cfg_mqa_args, rope_type="default")
+
+    b, s = 1, 16
+    d_c = cfg_dense.kv_lora_rank  # 512
+    d_rope = cfg_dense.qk_rope_head_dim  # 64
+    d_nope = cfg_dense.qk_nope_head_dim  # 192
+    num_heads = mla_dense.num_query_heads
+
+    low_rank_main = jnp.ones((b, s, d_c), dtype=jnp.float32)
+    key_rope = jnp.ones((b, s, 1, d_rope), dtype=jnp.float32)
+
+    # 1. Uncompressed Dense MLA KV projection on real module
+    key_dense, val_dense = mla_dense.mla_get_key_value(low_rank_main, key_rope, MODEL_MODE_PREFILL)
+    self.assertEqual(key_dense.shape, (b, s, num_heads, d_nope + d_rope))
+    self.assertEqual(val_dense.shape, (b, s, num_heads, mla_dense.v_head_dim))
+
+    # 2. Latent MQA KV projection on real module
+    key_mqa, val_mqa = mla_mqa.get_kv_latent(low_rank_main, key_rope)
+    self.assertEqual(key_mqa.shape, (b, s, 1, d_c + d_rope))
+    self.assertEqual(val_mqa.shape, (b, s, 1, d_c))
+    mqa_elements_per_token = key_mqa.size // (b * s)
+    self.assertEqual(mqa_elements_per_token, 576)
+    mqa_bytes_per_token_bf16 = mqa_elements_per_token * 2  # 1,152 bytes = 1.15 KB
+    self.assertEqual(mqa_bytes_per_token_bf16, 1152)
+
+    # 3. Production DeepSeek-V3 architecture specification: 64 heads, d_nope=192, d_rope=64, d_v=256
+    prod_heads = 64
+    prod_d_v = 256
+    prod_dense_elements_per_token = prod_heads * (d_nope + d_rope) + prod_heads * prod_d_v
+    self.assertEqual(prod_dense_elements_per_token, 32768)
+    prod_dense_bytes_per_token_bf16 = prod_dense_elements_per_token * 2  # 65,536 bytes = 64 KB
+    self.assertEqual(prod_dense_bytes_per_token_bf16, 65536)
+
+    # 4. Reduction ratio: 32,768 / 576 = 56.888... (~57x)
+    ratio = prod_dense_elements_per_token / mqa_elements_per_token
+    self.assertAlmostEqual(ratio, 56.8888, places=3)
+
+    # 5. Gather volume for K=2048 tokens in DeepSeek Sparse Attention (DSA)
+    tokens_k = 2048
+    uncompressed_gather_bytes = tokens_k * prod_dense_bytes_per_token_bf16
+    latent_gather_bytes = tokens_k * mqa_bytes_per_token_bf16
+    self.assertEqual(uncompressed_gather_bytes, 128 * (1024**2))  # 128 MB
+    self.assertEqual(latent_gather_bytes, 2359296)  # 2.25 MB
+    gather_ratio = uncompressed_gather_bytes / latent_gather_bytes
+    self.assertAlmostEqual(gather_ratio, 56.8888, places=3)
+
+  def test_mla_absorbed_mqa_shapes_and_identities(self):
+    """Verifies shapes, scale factor preservation, and linear associativity identities."""
+    _, mla = self.init_mla(self.config_arguments, rope_type="default")
+    b, t, s, h = 1, 4, 16, 64
+    d_c, d_nope, d_rope, d_v = 512, 192, 64, 256
+
+    rng = jax.random.PRNGKey(101)
+    k1, k2, k3, k4, k5, k6 = jax.random.split(rng, 6)
+    q_n = jax.random.normal(k1, (b, t, h, d_nope)) / math.sqrt(d_nope)
+    q_p = jax.random.normal(k2, (b, t, h, d_rope)) / math.sqrt(d_rope)
+    c_k = jax.random.normal(k3, (b, s, d_c)) / math.sqrt(d_c)
+    k_p = jax.random.normal(k4, (b, s, 1, d_rope)) / math.sqrt(d_rope)
+    w_k = jax.random.normal(k5, (d_c, h, d_nope)) / math.sqrt(d_c)
+    w_v = jax.random.normal(k6, (d_c, h, d_v)) / math.sqrt(d_c)
+
+    # Helper method shapes
+    q_mqa = mla.absorb_query(q_n, q_p, w_k)
+    self.assertEqual(q_mqa.shape, (b, t, h, 576))
+
+    kv_latent, val_latent = mla.get_kv_latent(c_k, k_p)
+    self.assertEqual(kv_latent.shape, (b, s, 1, 576))
+    self.assertEqual(val_latent.shape, (b, s, 1, 512))
+
+    out_latent = jax.random.normal(rng, (b, t, h, d_c))
+    out_absorbed = mla.absorb_output(out_latent, w_v)
+    self.assertEqual(out_absorbed.shape, (b, t, h, d_v))
+
+    # Softmax scale base uses (qk_nope_head_dim + qk_rope_head_dim)=256 -> 1/sqrt(256)=0.0625, NOT 1/sqrt(576) (catching D4)
+    expected_base_scale = (mla.qk_nope_head_dim + mla.qk_rope_head_dim) ** -0.5
+    if mla.max_position_embeddings > mla.original_max_position_embeddings:
+      mscale = 0.1 * mla.mscale * math.log(mla.rope_factor) + 1.0
+      expected_scale = expected_base_scale * mscale * mscale
+      wrong_scale = ((mla.kv_lora_rank + mla.qk_rope_head_dim) ** -0.5) * mscale * mscale
+    else:
+      expected_scale = expected_base_scale
+      wrong_scale = (mla.kv_lora_rank + mla.qk_rope_head_dim) ** -0.5
+    self.assertAlmostEqual(mla.softmax_scale, expected_scale, places=6)
+    self.assertNotAlmostEqual(mla.softmax_scale, wrong_scale, places=6)
+
+    # Linear associativity: (Q_nope W_UK) @ C_KV^T == Q_nope @ (C_KV W_UK)^T
+    q_absorbed_slice = q_mqa[..., :d_c]
+    score_absorbed = jnp.einsum("bthc, bsc -> bhts", q_absorbed_slice, c_k)
+    k_nope_ref = jnp.einsum("bsc, chd -> bshd", c_k, w_k)
+    score_standard = jnp.einsum("bthd, bshd -> bhts", q_n, k_nope_ref)
+    diff = float(jnp.max(jnp.abs(score_absorbed - score_standard)))
+    self.assertLessEqual(diff, 1e-5)
+
+  def test_mla_absorbed_mqa_prefill_to_decode_parity(self):
+    """Verifies prefill-to-autoregressive-decode parity between dense MLA and absorbed MLA (catching A1 / D1)."""
+    cfg_dense, mla_dense = self.init_mla(self.config_arguments, rope_type="default")
+    cfg_mqa_args = self.config_arguments.copy()
+    cfg_mqa_args["use_mla_absorbed_mqa"] = True
+    _, mla_mqa = self.init_mla(cfg_mqa_args, rope_type="default")
+    nnx.update(mla_mqa, nnx.state(mla_dense))
+
+    prefill_length = cfg_dense.max_prefill_predict_length
+    decode_total_length = cfg_dense.max_target_length
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg_dense, "float32")
+
+    # 1. Prefill Parity
+    lnx_prefill = lnx[:, 0:prefill_length, :]
+    decoder_segment_ids_prefill = decoder_segment_ids[:, 0:prefill_length]
+    decoder_positions_prefill = decoder_positions[:, 0:prefill_length]
+
+    out_prefill_dense, _ = mla_dense(
+        lnx_prefill,
+        lnx_prefill,
+        decoder_segment_ids=decoder_segment_ids_prefill,
+        inputs_positions=decoder_positions_prefill,
+        deterministic=True,
+        model_mode=MODEL_MODE_PREFILL,
+    )
+    out_prefill_mqa, _ = mla_mqa(
+        lnx_prefill,
+        lnx_prefill,
+        decoder_segment_ids=decoder_segment_ids_prefill,
+        inputs_positions=decoder_positions_prefill,
+        deterministic=True,
+        model_mode=MODEL_MODE_PREFILL,
+    )
+    diff_prefill = float(jnp.max(jnp.abs(out_prefill_dense - out_prefill_mqa)))
+    self.assertLessEqual(diff_prefill, 1e-4, f"Prefill parity failed: {diff_prefill} > 1e-4")
+
+    # 2. Autoregressive Decode Step-by-Step Parity
+    for idx in range(prefill_length, min(prefill_length + 3, decode_total_length)):
+      lnx_idx = lnx[:, idx : idx + 1, :]
+      decoder_positions_idx = decoder_positions[:, idx : idx + 1]
+
+      out_ar_dense, _ = mla_dense(
+          lnx_idx,
+          lnx_idx,
+          inputs_positions=decoder_positions_idx,
+          deterministic=True,
+          model_mode=MODEL_MODE_AUTOREGRESSIVE,
+      )
+      out_ar_mqa, _ = mla_mqa(
+          lnx_idx,
+          lnx_idx,
+          inputs_positions=decoder_positions_idx,
+          deterministic=True,
+          model_mode=MODEL_MODE_AUTOREGRESSIVE,
+      )
+      diff_ar = float(jnp.max(jnp.abs(out_ar_dense - out_ar_mqa)))
+      self.assertLessEqual(diff_ar, 1e-4, f"AR decode parity failed at step {idx}: {diff_ar} > 1e-4")
+
+  def test_mla_absorbed_mqa_sliced_proj(self):
+    """Verifies that use_sliced_mla_proj works with exact parity under use_mla_absorbed_mqa."""
+    cfg = self.config_arguments.copy()
+    cfg["use_mla_absorbed_mqa"] = True
+    cfg["q_lora_rank"] = 512
+    cfg["use_sliced_mla_proj"] = False
+
+    cfg_sliced = cfg.copy()
+    cfg_sliced["use_sliced_mla_proj"] = True
+
+    cfg_obj_normal, mla_normal = self.init_mla(cfg, rope_type="default")
+    _, mla_sliced = self.init_mla(cfg_sliced, rope_type="default")
+    nnx.update(mla_sliced, nnx.state(mla_normal))
+
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg_obj_normal, "float32")
+    out_normal, _ = mla_normal(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    out_sliced, _ = mla_sliced(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    diff = float(jnp.max(jnp.abs(out_normal - out_sliced)))
+    self.assertLessEqual(diff, 1e-5, f"Sliced vs Unsliced Absorbed MQA diff too large: {diff}")
+
+  def test_incompatible_attention_flash(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with flash attention (catching A2 / D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "attention": "flash"})
+    with self.assertRaisesRegex(ValueError, "requires `attention` to be 'dot_product' or 'autoselected'"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_incompatible_attention_paged(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with paged attention (catching A3 / D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "attention": "paged"})
+    with self.assertRaisesRegex(ValueError, "requires `attention` to be 'dot_product' or 'autoselected'"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_incompatible_naive_kvcache(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with naive KV cache (catching A3 / D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "mla_naive_kvcache": True})
+    with self.assertRaisesRegex(ValueError, "incompatible with `mla_naive_kvcache=True`"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_incompatible_kv_quant(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with kv cache quantization (catching A4 / D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "quantize_kvcache": True})
+    with self.assertRaisesRegex(ValueError, "incompatible with quantization"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_incompatible_attention_type(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with non-MLA attention (catching C4 / D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "attention_type": "global"})
+    with self.assertRaisesRegex(ValueError, "requires `attention_type='mla'`"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_incompatible_fp8_options(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with experimental fp8 quant (catching A7 / D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "experimental_sa_quant_k_fp8": True})
+    with self.assertRaisesRegex(ValueError, "incompatible with quantization or FP8"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_incompatible_weight_quantization(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with weight quantization (catching A7 / C4 / D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "quantization": "int8"})
+    with self.assertRaisesRegex(ValueError, "incompatible with quantization"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_mla_absorbed_mqa_sharded_mesh_compilation(self):
+    """Verifies that MLA absorbed MQA compiles and executes across modes on a sharded mesh (catching B2 / D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True})
+    cfg, mla = self.init_mla(cfg_args, rope_type="default")
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg, "float32")
+
+    @nnx.jit
+    def fwd_train(m, x, seg, pos):
+      return m(x, x, decoder_segment_ids=seg, inputs_positions=pos, deterministic=True, model_mode=MODEL_MODE_TRAIN)
+
+    out_train, _ = fwd_train(mla, lnx, decoder_segment_ids, decoder_positions)
+    self.assertEqual(out_train.shape, lnx.shape)
+    self.assertFalse(jnp.isnan(out_train).any())
+
+    # Prefill mode
+    prefill_len = cfg.max_prefill_predict_length
+    lnx_prefill = lnx[:, :prefill_len, :]
+    pos_prefill = decoder_positions[:, :prefill_len]
+    seg_prefill = decoder_segment_ids[:, :prefill_len]
+
+    @nnx.jit
+    def fwd_prefill(m, x, seg, pos):
+      return m(x, x, decoder_segment_ids=seg, inputs_positions=pos, deterministic=True, model_mode=MODEL_MODE_PREFILL)
+
+    out_prefill, _ = fwd_prefill(mla, lnx_prefill, seg_prefill, pos_prefill)
+    self.assertEqual(out_prefill.shape, lnx_prefill.shape)
+    self.assertFalse(jnp.isnan(out_prefill).any())
+
+    # AR decode mode
+    lnx_ar = lnx[:, prefill_len : prefill_len + 1, :]
+    pos_ar = decoder_positions[:, prefill_len : prefill_len + 1]
+
+    @nnx.jit
+    def fwd_decode(m, x, pos):
+      return m(x, x, inputs_positions=pos, deterministic=True, model_mode=MODEL_MODE_AUTOREGRESSIVE)
+
+    out_ar, _ = fwd_decode(mla, lnx_ar, pos_ar)
+    self.assertEqual(out_ar.shape, lnx_ar.shape)
+    self.assertFalse(jnp.isnan(out_ar).any())
+
+  def test_non_absorbed_mqa_retains_sharding_and_behavior(self):
+    """Verifies non-absorbed MQA models (like Gemma-2B) retain expected shapes and sharding behavior (catching B1)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update(
+        {
+            "base_num_query_heads": 8,
+            "base_num_kv_heads": 1,
+            "attention_type": AttentionType.GLOBAL.value,
+            "use_mla_absorbed_mqa": False,
+        }
+    )
+    cfg = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        **cfg_args,
+    )
+    devices_array = maxtext_utils.create_device_mesh(cfg)
+    mesh = Mesh(devices_array, cfg.mesh_axes)
+    dummy_inputs = jnp.ones((cfg.global_batch_size_to_train_on, cfg.max_target_length, cfg.base_emb_dim))
+
+    attn_mqa = Attention(
+        config=cfg,
+        num_query_heads=cfg.num_query_heads,
+        num_kv_heads=cfg.num_kv_heads,
+        head_dim=cfg.head_dim,
+        max_target_length=cfg.max_target_length,
+        max_prefill_predict_length=cfg.max_prefill_predict_length,
+        inputs_q_shape=dummy_inputs.shape,
+        inputs_kv_shape=dummy_inputs.shape,
+        mesh=mesh,
+        attention_kernel="dot_product",
+        dtype=cfg.dtype,
+        attention_type=AttentionType.GLOBAL.value,
+        model_mode=MODEL_MODE_PREFILL,
+        rngs=self.nnx_rng,
+    )
+    # AttentionOp should not have is_absorbed_mqa set to True
+    self.assertFalse(attn_mqa.attention_op.is_absorbed_mqa)
+    self.assertEqual(attn_mqa.attention_op.num_kv_heads, 1)
+
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg, "float32")
+    out, _ = attn_mqa(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    self.assertEqual(out.shape, lnx.shape)
+    self.assertFalse(jnp.isnan(out).any())
+
+  def test_incompatible_qwix_quantization(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with qwix quantization (catching A7 / C4)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "use_qwix_quantization": True})
+    with self.assertRaisesRegex(ValueError, "incompatible with quantization"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_incompatible_manual_quantization(self):
+    """Asserts ValueError when use_mla_absorbed_mqa is combined with manual quantization (catching A7 / C4)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args.update({"use_mla_absorbed_mqa": True, "use_manual_quantization": True})
+    with self.assertRaisesRegex(ValueError, "incompatible with quantization"):
+      pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+
+  def test_mla_absorbed_mqa_indexer_loss_parity(self):
+    """Verifies that absorbed MLA calculate_indexer_loss matches dense MLA bit-for-bit across scan modes (catching C2)."""
+    cfg_dense_args = self.config_arguments.copy()
+    cfg_dense_args.update(
+        {
+            "use_mla_absorbed_mqa": False,
+            "use_indexer": True,
+            "indexer_n_heads": 4,
+            "indexer_head_dim": 64,
+            "indexer_topk": 4,
+            "q_lora_rank": 16,
+            "indexer_loss_scaling_factor": 0.1,
+        }
+    )
+    cfg_dense, mla_dense = self.init_mla(cfg_dense_args, rope_type="default")
+    cfg_mqa_args = cfg_dense_args.copy()
+    cfg_mqa_args["use_mla_absorbed_mqa"] = True
+    _, mla_mqa = self.init_mla(cfg_mqa_args, rope_type="default")
+    nnx.update(mla_mqa, nnx.state(mla_dense))
+
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg_dense, "float32")
+
+    # Native implementation parity
+    _, _ = mla_dense(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    loss_dense = float(mla_dense.indexer_loss[...])
+
+    _, _ = mla_mqa(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    loss_mqa = float(mla_mqa.indexer_loss[...])
+    self.assertAlmostEqual(loss_dense, loss_mqa, places=6)
+
+    # Chunked head scan parity
+    cfg_chunk_args = cfg_dense_args.copy()
+    cfg_chunk_args["mla_qk_head_chunk_size"] = 2
+    _, mla_dense_chunk = self.init_mla(cfg_chunk_args, rope_type="default")
+    cfg_mqa_chunk_args = cfg_mqa_args.copy()
+    cfg_mqa_chunk_args["mla_qk_head_chunk_size"] = 2
+    _, mla_mqa_chunk = self.init_mla(cfg_mqa_chunk_args, rope_type="default")
+    nnx.update(mla_mqa_chunk, nnx.state(mla_dense_chunk))
+
+    _, _ = mla_dense_chunk(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    loss_dense_chunk = float(mla_dense_chunk.indexer_loss[...])
+
+    _, _ = mla_mqa_chunk(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    loss_mqa_chunk = float(mla_mqa_chunk.indexer_loss[...])
+    self.assertAlmostEqual(loss_dense_chunk, loss_mqa_chunk, places=6)
+
+  def test_incompatible_direct_layer_kv_quant(self):
+    """Verifies that direct MLA layer construction with kv_quant raises ValueError (catching A4/D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args["use_mla_absorbed_mqa"] = True
+    cfg = pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+    devices_array = maxtext_utils.create_device_mesh(cfg)
+    mesh = Mesh(devices_array, cfg.mesh_axes)
+    dummy_kv_quant = unittest.mock.MagicMock()
+
+    with self.assertRaisesRegex(ValueError, "incompatible with quantization"):
+      MLA(
+          config=cfg,
+          num_query_heads=cfg.num_query_heads,
+          num_kv_heads=cfg.num_kv_heads,
+          head_dim=cfg.head_dim,
+          max_target_length=cfg.max_target_length,
+          mesh=mesh,
+          attention_kernel="dot_product",
+          inputs_q_shape=(1, 16, cfg.base_emb_dim),
+          inputs_kv_shape=(1, 16, cfg.base_emb_dim),
+          dtype=cfg.dtype,
+          attention_type=AttentionType.MLA.value,
+          kv_quant=dummy_kv_quant,
+          rngs=self.nnx_rng,
+      )
+
+  def test_incompatible_direct_layer_flash(self):
+    """Verifies that direct MLA layer construction with attention_kernel='flash' raises ValueError (catching A2/D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args["use_mla_absorbed_mqa"] = True
+    cfg = pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+    devices_array = maxtext_utils.create_device_mesh(cfg)
+    mesh = Mesh(devices_array, cfg.mesh_axes)
+
+    with self.assertRaisesRegex(ValueError, "requires 'dot_product' or 'autoselected' attention"):
+      MLA(
+          config=cfg,
+          num_query_heads=cfg.num_query_heads,
+          num_kv_heads=cfg.num_kv_heads,
+          head_dim=cfg.head_dim,
+          max_target_length=cfg.max_target_length,
+          mesh=mesh,
+          attention_kernel="flash",
+          inputs_q_shape=(1, 16, cfg.base_emb_dim),
+          inputs_kv_shape=(1, 16, cfg.base_emb_dim),
+          dtype=cfg.dtype,
+          attention_type=AttentionType.MLA.value,
+          rngs=self.nnx_rng,
+      )
+
+  def test_incompatible_direct_layer_weight_quant(self):
+    """Verifies that direct MLA layer construction with quant raises ValueError (catching A7/D6)."""
+    cfg_args = self.config_arguments.copy()
+    cfg_args["use_mla_absorbed_mqa"] = True
+    cfg = pyconfig.initialize([sys.argv[0], get_test_config_path()], **cfg_args)
+    devices_array = maxtext_utils.create_device_mesh(cfg)
+    mesh = Mesh(devices_array, cfg.mesh_axes)
+    dummy_quant = unittest.mock.MagicMock()
+
+    with self.assertRaisesRegex(ValueError, "incompatible with quantization"):
+      MLA(
+          config=cfg,
+          num_query_heads=cfg.num_query_heads,
+          num_kv_heads=cfg.num_kv_heads,
+          head_dim=cfg.head_dim,
+          max_target_length=cfg.max_target_length,
+          mesh=mesh,
+          attention_kernel="dot_product",
+          inputs_q_shape=(1, 16, cfg.base_emb_dim),
+          inputs_kv_shape=(1, 16, cfg.base_emb_dim),
+          dtype=cfg.dtype,
+          attention_type=AttentionType.MLA.value,
+          quant=dummy_quant,
+          rngs=self.nnx_rng,
+      )
 
 
 if __name__ == "__main__":
