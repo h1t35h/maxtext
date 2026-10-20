@@ -1,0 +1,37 @@
+# Copyright 2023-2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Arm R2' (Corrected Sequence-Level GSPO-MiMo):
+#   - Sequence-level geometric importance ratio (loss_algo: "gspo-token", gspo_pool_mode: "sequence")
+#   - Sequence-mean-token-mean loss aggregation (loss_agg_mode: "sequence-mean-token-mean")
+#   - Mass-conserving MiMo-V2-Flash advantage shaping (beta_pos=0.5, span_renormalize=true)
+#   - Standard PPO min-clipping (clip_mode: "ppo", eps_l=3e-4, eps_h=4e-4)
+#   - Micro-batch-consistent trainer old logprobs (use_rollout_logps: false) + token-level TIS (C=2.0)
+
+base_config: "rl_code_gspo_mimo.yml"
+run_name: "r2p_gspo_mimo"
+
+rl:
+  off_policy_steps: 0
+  loss_algo: "gspo-token"
+  gspo_pool_mode: "sequence"
+  loss_agg_mode: "sequence-mean-token-mean"
+  advantage_estimator: "mimo"
+  token_advantage_mode: "mimo"
+  clip_mode: "ppo"
+  grpo_epsilon: 3.0e-4
+  epsilon_high: 4.0e-4
+  use_rollout_logps: false
+  sampler_is: "token"
+  sampler_is_threshold: 2.0

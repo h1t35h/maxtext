@@ -24,6 +24,13 @@ import sys
 import tempfile
 import time
 import unittest
+
+_MAXTEXT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if _MAXTEXT_ROOT not in sys.path:
+  sys.path.insert(0, _MAXTEXT_ROOT)
+_existing_pypath = os.environ.get("PYTHONPATH", "")
+if _MAXTEXT_ROOT not in _existing_pypath.split(os.pathsep):
+  os.environ["PYTHONPATH"] = f"{_MAXTEXT_ROOT}{os.pathsep}{_existing_pypath}" if _existing_pypath else _MAXTEXT_ROOT
 from unittest import mock
 import grain
 import numpy as np
@@ -928,6 +935,254 @@ class TrainRLTest(unittest.TestCase):
     trainer_config = SimpleNamespace(reward_functions_path="/tmp/my_rewards.py", reward_functions="")
     reward_fns = train_rl.build_reward_fns(trainer_config, make_reward_fn=lambda fn: fn)
     self.assertEqual(len(reward_fns), 3)
+
+  def test_build_reward_fns_uses_trajectory_reward_passthrough_when_env_class_set(self):
+    """When rl.env_class_path is set without custom reward functions, trajectory_reward_passthrough is used."""
+    trainer_config = SimpleNamespace(
+        reward_functions_path="",
+        reward_functions="",
+        rl=SimpleNamespace(env_class_path="tunix.rl.agentic.environments.code.code_env.PythonCodeEnv"),
+    )
+    reward_fns = train_rl.build_reward_fns(trainer_config, make_reward_fn=lambda fn: fn)
+    self.assertEqual(reward_fns, [train_rl.utils_rl.trajectory_reward_passthrough])
+    self.assertEqual(
+        reward_fns[0](prompts=["p1", "p2"], completions=["c1", "c2"], trajectory_rewards=[1.0, 0.0]),
+        [1.0, 0.0],
+    )
+
+  def test_rl_config_mimo_and_mini_batch_train_steps(self):
+    """Verify MimoConfig, new RL fields, and train_steps scaling with mini_batch_size."""
+    cfg = types.RLConfig(
+        model_name="qwen3-4b",
+        batch_size=8,
+        num_batches=150,
+        num_iterations=1,
+        train_fraction=1.0,
+        num_epoch=1,
+        mini_batch_size=2,
+        loss_algo="grpo",
+        advantage_estimator="mimo",
+        token_advantage_mode="mimo",
+        clip_mode="mask",
+        grpo_beta=0.0,
+        grpo_epsilon=0.8,
+        epsilon_high=4.0,
+        epsilon_neg=0.8,
+        epsilon_neg_high=4.0,
+        mimo={"lp_pass_rate_threshold": 0.5, "span_kappa": 1.5},
+        env_class_path="tunix.rl.agentic.environments.code.code_env.PythonCodeEnv",
+        env_kwargs={"max_steps": 3, "test_timeout_s": 3.0},
+        group_postprocessor_path="tunix.rl.agentic.environments.code.code_judge_postprocessor.CodeJudgeGroupPostProcessor",
+    )
+    self.assertEqual(cfg.train_steps, 600)
+    self.assertEqual(cfg.rl.mini_batch_size, 2)
+    self.assertEqual(cfg.rl.advantage_estimator, "mimo")
+    self.assertEqual(cfg.rl.token_advantage_mode, "mimo")
+    self.assertEqual(cfg.rl.clip_mode, "mask")
+    self.assertIsNotNone(cfg.rl.mimo)
+    self.assertEqual(cfg.rl.mimo.lp_pass_rate_threshold, 0.5)
+    self.assertEqual(cfg.rl.mimo.span_kappa, 1.5)
+    self.assertEqual(cfg.rl.env_kwargs, {"max_steps": 3, "test_timeout_s": 3.0})
+
+  @mock.patch("datasets.load_dataset")
+  def test_get_dataset_selects_json_builder_for_jsonl_files(self, mock_load):
+    """get_dataset uses the 'json' builder when data_files is .jsonl/.json or dataset_name is 'json'."""
+    cfg = SimpleNamespace(debug=False, hf_subset=None)
+    train_rl.get_dataset(cfg, split="train", data_files="/tmp/code_rl_train.jsonl", dataset_name="json")
+    mock_load.assert_called_once_with(
+        "json",
+        data_files={"train": "/tmp/code_rl_train.jsonl"},
+        split="train",
+    )
+    mock_load.reset_mock()
+    train_rl.get_dataset(cfg, split="train", data_files="/tmp/data.parquet", dataset_name="openai/gsm8k")
+    mock_load.assert_called_once_with(
+        "parquet",
+        data_files={"train": "/tmp/data.parquet"},
+        split="train",
+    )
+
+  def test_build_group_postprocessor_sets_local_rules_only_when_no_judge_url(self):
+    """_build_group_postprocessor forwards local_rules_only=True when judge_base_url is empty."""
+
+    class CapturingPostProcessor:
+
+      def __init__(self, tokenizer=None, judge_base_url="", local_rules_only=False):
+        self.tokenizer = tokenizer
+        self.judge_base_url = judge_base_url
+        self.local_rules_only = local_rules_only
+
+      def process_group(self, group):
+        return group
+
+    with mock.patch.object(train_rl.utils_rl, "load_custom_callable", return_value=CapturingPostProcessor):
+      cfg_no_judge = types.RLConfig(
+          model_name="qwen3-0.6b",
+          group_postprocessor_path="dummy.CapturingPostProcessor",
+          judge_base_url="",
+      )
+      post_no_judge = train_rl._build_group_postprocessor(cfg_no_judge, model_tokenizer="tok")  # pylint: disable=protected-access
+      self.assertTrue(post_no_judge.local_rules_only)
+
+      cfg_with_judge = types.RLConfig(
+          model_name="qwen3-0.6b",
+          group_postprocessor_path="dummy.CapturingPostProcessor",
+          judge_base_url="http://127.0.0.1:8000/v1",
+      )
+      post_with_judge = train_rl._build_group_postprocessor(cfg_with_judge, model_tokenizer="tok")  # pylint: disable=protected-access
+      self.assertFalse(post_with_judge.local_rules_only)
+
+  def test_create_models_and_meshes_skips_reference_when_grpo_beta_zero(self):
+    """When grpo_beta == 0.0, create_models_and_meshes skips reference_model creation."""
+    trainer_config = SimpleNamespace(
+        rl=SimpleNamespace(grpo_beta=0.0),
+        grpo_beta=0.0,
+        load_checkpoint_only_once=True,
+    )
+    sampler_config = SimpleNamespace(mesh_axes=("data",))
+    fake_actor = object()
+    fake_mesh = object()
+    with (
+        mock.patch.object(model_creation_utils, "from_pretrained", return_value=(fake_actor, fake_mesh)) as mock_fp,
+        mock.patch.object(model_creation_utils.maxtext_utils, "create_device_mesh", return_value=np.zeros((1,))),
+        mock.patch.object(model_creation_utils, "Mesh", return_value=object()),
+    ):
+      ref_model, ref_mesh, actor_model, actor_mesh, _ = model_creation_utils.create_models_and_meshes(
+          trainer_config,
+          sampler_config,
+          trainer_devices=[object()],
+          sampler_devices=[object()],
+          tokenizer_pad_id=0,
+      )
+    mock_fp.assert_called_once()
+    self.assertIsNone(ref_model)
+    self.assertIsNone(ref_mesh)
+    self.assertIs(actor_model, fake_actor)
+    self.assertIs(actor_mesh, fake_mesh)
+
+  def test_create_rl_components_agentic_guards_deprecated_kwargs_and_wires_env(self):
+    """AgenticGrpoConfig without force_on_policy_ratio does not crash, and env_class/mimo/mini_batch_size are wired."""
+
+    @dataclasses.dataclass
+    class FakeAgenticGrpoConfig:
+      num_generations: int = 2
+      num_iterations: int = 1
+      beta: float = 0.0
+      epsilon: float = 0.2
+      loss_algo: str = "grpo"
+      loss_agg_mode: str = "token-mean"
+      max_response_length: int = 128
+      max_concurrency: int = 16
+      off_policy_steps: int = 0
+      system_prompt: str = ""
+      epsilon_high: float | None = None
+      use_rollout_logps: bool = True
+      advantage_estimator: str = "grpo"
+      clip_mode: str = "ppo"
+      token_advantage_mode: str = "none"
+      mimo: object | None = None
+
+    captured_learner_kwargs = {}
+    captured_training_kwargs = {}
+    captured_rollout_kwargs = {}
+
+    class FakeAgenticGrpoLearner:
+
+      def __init__(self, rl_cluster, reward_fns, algo_config, chat_parser=None, metric_fns=None, env_class=None, env_kwargs=None, group_postprocessor=None):
+        captured_learner_kwargs.update(
+            algo_config=algo_config,
+            chat_parser=chat_parser,
+            metric_fns=metric_fns,
+            env_class=env_class,
+            env_kwargs=env_kwargs,
+            group_postprocessor=group_postprocessor,
+        )
+
+    class FakeDummyEnv:
+      pass
+
+    class FakePostProcessor:
+
+      def __init__(self, tokenizer=None, judge_base_url="", local_rules_only=False):
+        self.tokenizer = tokenizer
+        self.judge_base_url = judge_base_url
+        self.local_rules_only = local_rules_only
+
+      def process_group(self, group):
+        return group
+
+    trainer_config = types.RLConfig(
+        model_name="qwen3-0.6b",
+        enable_checkpointing=False,
+        enable_tunix_perf_metrics=False,
+        batch_size=8,
+        mini_batch_size=2,
+        decode_sampling_top_k=0,
+        use_agentic_rollout=True,
+        grpo_beta=0.0,
+        loss_algo="grpo",
+        advantage_estimator="mimo",
+        token_advantage_mode="mimo",
+        clip_mode="mask",
+        mimo={"lp_pass_rate_threshold": 0.5, "span_kappa": 1.5},
+        env_class_path="dummy.env.FakeDummyEnv",
+        env_kwargs={"max_steps": 3},
+        group_postprocessor_path="dummy.post.FakePostProcessor",
+        judge_base_url="http://127.0.0.1:8000/v1",
+    )
+
+    def fake_load_callable(path, fn_name=None, **kwargs):
+      del fn_name, kwargs
+      if "FakeDummyEnv" in path:
+        return FakeDummyEnv
+      if "FakePostProcessor" in path:
+        return FakePostProcessor
+      raise ValueError(path)
+
+    fake_agentic_mod = SimpleNamespace(GrpoConfig=FakeAgenticGrpoConfig, GrpoLearner=FakeAgenticGrpoLearner)
+    with (
+        mock.patch.dict(sys.modules, {"tunix.rl.agentic.agentic_grpo_learner": fake_agentic_mod}),
+        mock.patch.object(train_rl.utils_rl, "get_optimizer"),
+        mock.patch.object(train_rl.utils_rl, "load_custom_callable", side_effect=fake_load_callable),
+        mock.patch.object(train_rl.pyconfig, "initialize", return_value=SimpleNamespace(logical_axis_rules=[])),
+        mock.patch.object(
+            train_rl.base_rollout,
+            "RolloutConfig",
+            side_effect=lambda **kw: captured_rollout_kwargs.update(kw) or SimpleNamespace(**kw),
+        ),
+        mock.patch.object(train_rl.rl_cluster_lib, "ClusterConfig"),
+        mock.patch.object(
+            train_rl.rl_cluster_lib,
+            "RLTrainingConfig",
+            side_effect=lambda **kw: captured_training_kwargs.update(kw) or SimpleNamespace(**kw),
+        ),
+        mock.patch.object(train_rl.rl_cluster_lib, "RLCluster"),
+        mock.patch.object(train_rl, "get_rollout_kwargs_for_parallelism", return_value={}),
+    ):
+      train_rl.create_rl_components(
+          trainer_config=trainer_config,
+          sampler_config=SimpleNamespace(enable_expert_parallel=False),
+          sampler_devices=[object()],
+          actor_model=object(),
+          actor_mesh=object(),
+          reference_model=None,
+          reference_mesh=None,
+          rollout_mesh=object(),
+          model_tokenizer="fake_tok",
+      )
+
+    self.assertEqual(captured_training_kwargs["mini_batch_size"], 2)
+    self.assertIsNone(captured_rollout_kwargs["top_k"])
+    self.assertIsNone(captured_learner_kwargs["chat_parser"])
+    self.assertIs(captured_learner_kwargs["env_class"], FakeDummyEnv)
+    self.assertEqual(captured_learner_kwargs["env_kwargs"], {"max_steps": 3})
+    self.assertIsInstance(captured_learner_kwargs["group_postprocessor"], FakePostProcessor)
+    self.assertEqual(captured_learner_kwargs["group_postprocessor"].judge_base_url, "http://127.0.0.1:8000/v1")
+    self.assertFalse(captured_learner_kwargs["group_postprocessor"].local_rules_only)
+    self.assertEqual(captured_learner_kwargs["algo_config"].advantage_estimator, "mimo")
+    self.assertEqual(captured_learner_kwargs["algo_config"].clip_mode, "mask")
+    self.assertEqual(captured_learner_kwargs["algo_config"].token_advantage_mode, "mimo")
+    self.assertIsNotNone(captured_learner_kwargs["algo_config"].mimo)
 
 
 class TokenizerChatTemplateTest(unittest.TestCase):

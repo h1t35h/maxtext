@@ -35,9 +35,12 @@ used during GRPO/GSPO training to compute rewards for each example in a batch.
   native C extensions that ignore Python signals.
 """
 
+from __future__ import annotations
+
 import atexit
 import itertools
 import multiprocessing
+import multiprocessing.pool
 import os
 import threading
 import time
