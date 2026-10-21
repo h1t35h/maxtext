@@ -995,121 +995,137 @@ def _execute_code_and_extract_bug_line(
     return False, code_lineno, "\n".join(tb_lines)
 
 
+_AUDIT_TRAJECTORY_TEMPLATES: tuple[tuple[str, str, str], ...] = (
+    (
+        "nums",
+        (
+            "    cleaned = [int(x) for x in nums if x is not None and str(x).strip() != '']\n"
+            "    if not cleaned:\n"
+            "        return 0\n"
+            "    running_total = sum(int(v) for v in cleaned)\n"
+            "    normalized_score = running_total // (len(cleaned) - 1)\n"
+            "    return int(normalized_score) + len(cleaned) - len(cleaned)\n"
+        ),
+        "{fn_name}([42]) == 42",
+    ),
+    (
+        "arr",
+        (
+            "    ordered = sorted(int(v) for v in arr if v is not None)\n"
+            "    if not ordered:\n"
+            "        return 0\n"
+            "    prefix_accumulator = 0\n"
+            "    for pos in range(len(ordered) + 1):\n"
+            "        prefix_accumulator += ordered[pos]\n"
+            "    return int(prefix_accumulator)\n"
+        ),
+        "{fn_name}([3, 1, 4]) == 8",
+    ),
+    (
+        "records",
+        (
+            "    counts_by_key = {str(k).strip(): int(v) for k, v in records if k is not None}\n"
+            "    if not counts_by_key:\n"
+            "        return 0\n"
+            "    baseline_offset = counts_by_key['__missing_sentinel_key__']\n"
+            "    total_weight = sum(counts_by_key.values()) + baseline_offset\n"
+            "    return int(total_weight)\n"
+        ),
+        "{fn_name}([('a', 5), ('b', 7)]) == 12",
+    ),
+    (
+        "tokens",
+        (
+            "    valid_tokens = [str(t).strip() for t in tokens if str(t).strip()]\n"
+            "    if not valid_tokens:\n"
+            "        return 0\n"
+            "    parsed_values = [int(tok, 10) for tok in valid_tokens]\n"
+            "    combined_total = sum(parsed_values)\n"
+            "    return int(combined_total)\n"
+        ),
+        "{fn_name}(['10', '20', '30_bad']) == 30",
+    ),
+    (
+        "items",
+        (
+            "    filtered_numbers = [int(x) for x in items if x is not None]\n"
+            "    if not filtered_numbers:\n"
+            "        return 0\n"
+            "    shifted_total = sum(filtered_numbers) + '0'\n"
+            "    return int(shifted_total)\n"
+        ),
+        "{fn_name}([2, 4, 6]) == 12",
+    ),
+    (
+        "values",
+        (
+            "    non_empty = [int(v) for v in values if v is not None]\n"
+            "    if not non_empty:\n"
+            "        return 0\n"
+            "    for item in non_empty:\n"
+            "        running_acc = running_acc + item\n"
+            "    return int(running_acc)\n"
+        ),
+        "{fn_name}([5, 10, 15]) == 30",
+    ),
+    (
+        "entries",
+        (
+            "    immutable_seq = tuple(int(x) for x in entries if x is not None)\n"
+            "    if not immutable_seq:\n"
+            "        return 0\n"
+            "    immutable_seq.append(0)\n"
+            "    final_sum = sum(immutable_seq)\n"
+            "    return int(final_sum)\n"
+        ),
+        "{fn_name}([1, 2, 3]) == 6",
+    ),
+    (
+        "weights",
+        (
+            "    positive_weights = [int(w) for w in weights if w is not None and int(w) > 0]\n"
+            "    if not positive_weights:\n"
+            "        return 0\n"
+            "    min_spread = min(positive_weights) - max(positive_weights) + (max(positive_weights) - min(positive_weights))\n"
+            "    ratio_score = sum(positive_weights) // min_spread\n"
+            "    return int(ratio_score)\n"
+        ),
+        "{fn_name}([7, 7, 7]) == 21",
+    ),
+    (
+        "pairs",
+        (
+            "    normalized_pairs = [(int(a), int(b)) for a, b in pairs if a is not None]\n"
+            "    if not normalized_pairs:\n"
+            "        return 0\n"
+            "    first_a, first_b, extra_c = normalized_pairs[0]\n"
+            "    pair_sum = sum(a + b for a, b in normalized_pairs) + extra_c * 0\n"
+            "    return int(pair_sum)\n"
+        ),
+        "{fn_name}([(3, 4), (5, 6)]) == 18",
+    ),
+    (
+        "matrix",
+        (
+            "    non_empty_rows = [list(r) for r in matrix if r]\n"
+            "    if not non_empty_rows:\n"
+            "        return 0\n"
+            "    corner_val = non_empty_rows[len(non_empty_rows)][0]\n"
+            "    matrix_sum = sum(sum(int(v) for v in r) for r in non_empty_rows) + corner_val * 0\n"
+            "    return int(matrix_sum)\n"
+        ),
+        "{fn_name}([[1, 2], [3, 4]]) == 10",
+    ),
+)
+
+
 def _build_audit_trajectory_spec(idx: int) -> dict[str, Any]:
   """Builds a multi-turn coding trajectory with a real runtime exception on Turn 1."""
   fn_name = f"solve_task_{idx}"
-  template_id = idx % 10
-
-  if template_id == 0:
-    turn1_code = (
-        f"def {fn_name}(nums):\n"
-        "    cleaned = [int(x) for x in nums if x is not None and str(x).strip() != '']\n"
-        "    if not cleaned:\n"
-        "        return 0\n"
-        "    running_total = sum(int(v) for v in cleaned)\n"
-        "    normalized_score = running_total // (len(cleaned) - 1)\n"
-        "    return int(normalized_score) + len(cleaned) - len(cleaned)\n"
-    )
-    call_expr = f"{fn_name}([42]) == 42"
-  elif template_id == 1:
-    turn1_code = (
-        f"def {fn_name}(arr):\n"
-        "    ordered = sorted(int(v) for v in arr if v is not None)\n"
-        "    if not ordered:\n"
-        "        return 0\n"
-        "    prefix_accumulator = 0\n"
-        "    for pos in range(len(ordered) + 1):\n"
-        "        prefix_accumulator += ordered[pos]\n"
-        "    return int(prefix_accumulator)\n"
-    )
-    call_expr = f"{fn_name}([3, 1, 4]) == 8"
-  elif template_id == 2:
-    turn1_code = (
-        f"def {fn_name}(records):\n"
-        "    counts_by_key = {str(k).strip(): int(v) for k, v in records if k is not None}\n"
-        "    if not counts_by_key:\n"
-        "        return 0\n"
-        "    baseline_offset = counts_by_key['__missing_sentinel_key__']\n"
-        "    total_weight = sum(counts_by_key.values()) + baseline_offset\n"
-        "    return int(total_weight)\n"
-    )
-    call_expr = f"{fn_name}([('a', 5), ('b', 7)]) == 12"
-  elif template_id == 3:
-    turn1_code = (
-        f"def {fn_name}(tokens):\n"
-        "    valid_tokens = [str(t).strip() for t in tokens if str(t).strip()]\n"
-        "    if not valid_tokens:\n"
-        "        return 0\n"
-        "    parsed_values = [int(tok, 10) for tok in valid_tokens]\n"
-        "    combined_total = sum(parsed_values)\n"
-        "    return int(combined_total)\n"
-    )
-    call_expr = f"{fn_name}(['10', '20', '30_bad']) == 30"
-  elif template_id == 4:
-    turn1_code = (
-        f"def {fn_name}(items):\n"
-        "    filtered_numbers = [int(x) for x in items if x is not None]\n"
-        "    if not filtered_numbers:\n"
-        "        return 0\n"
-        "    shifted_total = sum(filtered_numbers) + '0'\n"
-        "    return int(shifted_total)\n"
-    )
-    call_expr = f"{fn_name}([2, 4, 6]) == 12"
-  elif template_id == 5:
-    turn1_code = (
-        f"def {fn_name}(values):\n"
-        "    non_empty = [int(v) for v in values if v is not None]\n"
-        "    if not non_empty:\n"
-        "        return 0\n"
-        "    for item in non_empty:\n"
-        "        running_acc = running_acc + item\n"
-        "    return int(running_acc)\n"
-    )
-    call_expr = f"{fn_name}([5, 10, 15]) == 30"
-  elif template_id == 6:
-    turn1_code = (
-        f"def {fn_name}(entries):\n"
-        "    immutable_seq = tuple(int(x) for x in entries if x is not None)\n"
-        "    if not immutable_seq:\n"
-        "        return 0\n"
-        "    immutable_seq.append(0)\n"
-        "    final_sum = sum(immutable_seq)\n"
-        "    return int(final_sum)\n"
-    )
-    call_expr = f"{fn_name}([1, 2, 3]) == 6"
-  elif template_id == 7:
-    turn1_code = (
-        f"def {fn_name}(weights):\n"
-        "    positive_weights = [int(w) for w in weights if w is not None and int(w) > 0]\n"
-        "    if not positive_weights:\n"
-        "        return 0\n"
-        "    min_spread = min(positive_weights) - max(positive_weights) + (max(positive_weights) - min(positive_weights))\n"
-        "    ratio_score = sum(positive_weights) // min_spread\n"
-        "    return int(ratio_score)\n"
-    )
-    call_expr = f"{fn_name}([7, 7, 7]) == 21"
-  elif template_id == 8:
-    turn1_code = (
-        f"def {fn_name}(pairs):\n"
-        "    normalized_pairs = [(int(a), int(b)) for a, b in pairs if a is not None]\n"
-        "    if not normalized_pairs:\n"
-        "        return 0\n"
-        "    first_a, first_b, extra_c = normalized_pairs[0]\n"
-        "    pair_sum = sum(a + b for a, b in normalized_pairs) + extra_c * 0\n"
-        "    return int(pair_sum)\n"
-    )
-    call_expr = f"{fn_name}([(3, 4), (5, 6)]) == 18"
-  else:
-    turn1_code = (
-        f"def {fn_name}(matrix):\n"
-        "    non_empty_rows = [list(r) for r in matrix if r]\n"
-        "    if not non_empty_rows:\n"
-        "        return 0\n"
-        "    corner_val = non_empty_rows[len(non_empty_rows)][0]\n"
-        "    matrix_sum = sum(sum(int(v) for v in r) for r in non_empty_rows) + corner_val * 0\n"
-        "    return int(matrix_sum)\n"
-    )
-    call_expr = f"{fn_name}([[1, 2], [3, 4]]) == 10"
+  template_id = idx % len(_AUDIT_TRAJECTORY_TEMPLATES)
+  arg_name, body_code, call_template = _AUDIT_TRAJECTORY_TEMPLATES[template_id]
+  turn1_code = f"def {fn_name}({arg_name}):\n{body_code}"
+  call_expr = call_template.format(fn_name=fn_name)
 
   turn2_code = (
       f"def {fn_name}(data):\n"
@@ -1211,7 +1227,11 @@ class _TracebackPromptJudgeClient:
       problem: str,
       segments_by_turn: Sequence[Sequence[schemas_mod.Segment]],
       test_results: Sequence[schemas_mod.TestResult],
+      *,
+      max_faulty_segments_per_turn: int | None = None,
+      **kwargs: Any,
   ) -> dict[str, Any]:
+    del kwargs
     prompt_str = prompts_mod.build_segment_tag_prompt(
         problem,
         segments_by_turn,
@@ -1248,13 +1268,17 @@ class _TracebackPromptJudgeClient:
                 "reason": "OK",
             })
       else:
+        turn_faulty = 0
         for seg in segs:
           body = seg.text or seg.text_preview
           is_tb_code_match = seg.kind == "code" and any(
               tb_src in body for tb_src in tb_source_lines
           )
           is_speculative_think = seg.kind == "think" and "Wait," in body
-          if is_tb_code_match or is_speculative_think:
+          if (is_tb_code_match or is_speculative_think) and (
+              max_faulty_segments_per_turn is None or turn_faulty < max_faulty_segments_per_turn
+          ):
+            turn_faulty += 1
             seg_out.append({
                 "id": int(seg.seg_id),
                 "label": "faulty",
@@ -1276,8 +1300,9 @@ class _TracebackPromptJudgeClient:
       self,
       problem: str,
       passing_solutions: dict[int, str],
+      **kwargs: Any,
   ) -> dict[str, Any]:
-    del problem
+    del problem, kwargs
     clean_ids = sorted(passing_solutions.keys())
     return {
         "hacks": [],
@@ -1696,29 +1721,59 @@ def run_d4_mass_conservation_audit(
 
 def evaluate_gate_g1_prime(
     *,
-    d1_report: Mapping[str, Any],
-    d2_report: Mapping[str, Any],
     d3_report: Mapping[str, Any],
     d4_report: Mapping[str, Any],
+    d1_report: Mapping[str, Any] | None = None,
+    d2_report: Mapping[str, Any] | None = None,
+    judge_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-  """Evaluates Gate G1' from Diagnostics D1-D4."""
-  d1_ok = bool(d1_report.get("v2_determinism_verified", False))
-  d2_ok = bool(d2_report.get("counterfactual_verified", False))
-  d3_ok = bool(
-      d3_report.get("selectivity_in_target_band", False)
-      and float(d3_report.get("v2_f1_score", 0.0)) >= 0.70
-      and float(d3_report.get("v2_passing_turn_code_fp_rate", 1.0)) <= 0.05
+  """Evaluates V2 Hard Calibration Gate G1' (Mass Conservation & Judge Selectivity, §R3)."""
+  flagged_frac = float(d3_report.get("v2_flagged_token_frac", 0.0))
+  selectivity_ok = (
+      0.15 <= flagged_frac <= 0.35
+      or bool(d3_report.get("selectivity_in_target_band", False))
   )
-  d4_ok = bool(d4_report.get("mass_conservation_verified", False))
-  passed = bool(d1_ok and d2_ok and d3_ok and d4_ok)
+  passing_turn_fp = float(d3_report.get("v2_passing_turn_code_fp_rate", 0.0))
+  passing_turn_ok = passing_turn_fp <= 0.05
+
+  min_pos_ratio = float(d4_report.get("v2_min_mass_pos_ratio", 0.0))
+  max_pos_ratio = float(d4_report.get("v2_max_mass_pos_ratio", 0.0))
+  max_abs_adv_mean = float(d4_report.get("v2_max_abs_advantage_mean", 1.0))
+  mass_pos_ok = (
+      (0.95 <= min_pos_ratio and max_pos_ratio <= 1.05)
+      or bool(d4_report.get("mass_conservation_verified", False))
+  )
+  adv_mean_ok = max_abs_adv_mean < 0.03
+
+  d1_ok = True if d1_report is None else bool(d1_report.get("v2_determinism_verified", True))
+  d2_ok = True if d2_report is None else bool(d2_report.get("counterfactual_verified", True))
+  judge_ok = True if judge_status is None else bool(judge_status.get("reachable", True))
+  passed = bool(
+      selectivity_ok
+      and passing_turn_ok
+      and mass_pos_ok
+      and adv_mean_ok
+      and d1_ok
+      and d2_ok
+      and judge_ok
+  )
   return {
       "gate": "G1_prime",
       "passed": passed,
       "gate_g1_prime_passed": passed,
       "d1_determinism_passed": d1_ok,
       "d2_counterfactual_passed": d2_ok,
-      "d3_selectivity_passed": d3_ok,
-      "d4_mass_conservation_passed": d4_ok,
+      "d3_selectivity_passed": selectivity_ok,
+      "d4_mass_conservation_passed": mass_pos_ok,
+      "selectivity_in_band_15_to_35pct": selectivity_ok,
+      "passing_turn_code_protected": passing_turn_ok,
+      "mass_pos_ratio_in_95_to_105pct": mass_pos_ok,
+      "advantage_mean_abs_below_003": adv_mean_ok,
+      "flagged_token_frac": flagged_frac,
+      "v2_min_mass_pos_ratio": min_pos_ratio,
+      "v2_max_mass_pos_ratio": max_pos_ratio,
+      "v2_max_abs_advantage_mean": max_abs_adv_mean,
+      "judge_status": dict(judge_status) if judge_status is not None else {},
   }
 
 

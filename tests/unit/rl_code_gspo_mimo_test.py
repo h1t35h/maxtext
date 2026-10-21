@@ -581,11 +581,7 @@ class RlCodeGspoMimoV2Test(unittest.TestCase):
             out_texts.append("```python\nprint('wrong')\n```")
         return SimpleNamespace(text=out_texts)
 
-    class _MinimalTok:
-
-      def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        del add_special_tokens
-        return [1] * max(1, len(text.split()))
+    from maxtext.trainers.post_train.rl.code_rl.dataset_processor import _MinimalTok
 
     problems = [
         {

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 import json
 from pathlib import Path
 from typing import Any
@@ -26,26 +26,30 @@ DEFAULT_FORMAT_INSTRUCTIONS: str = (
 )
 
 
-def _normalize_tests(raw_tests: Any, fmt: str) -> list[str] | dict[str, Any]:
-  """Validates and normalizes `tests` payload for `asserts` or `stdio` format."""
-  parsed = raw_tests
-  if isinstance(parsed, str):
-    stripped = parsed.strip()
+def _parse_raw_tests(raw_tests: Any) -> Any:
+  """Parses raw JSON strings or splits multi-line string tests into structured collections."""
+  if isinstance(raw_tests, str):
+    stripped = raw_tests.strip()
     if stripped.startswith(("[", "{")):
       try:
-        parsed = json.loads(stripped)
-      except json.JSONDecodeError:
-        parsed = [line.strip() for line in stripped.splitlines() if line.strip()]
+        return json.loads(stripped)
+      except Exception:  # pylint: disable=broad-except
+        return [line.strip() for line in stripped.splitlines() if line.strip()]
     elif stripped:
-      parsed = [line.strip() for line in stripped.splitlines() if line.strip()]
-    else:
-      parsed = []
+      return [line.strip() for line in stripped.splitlines() if line.strip()]
+    return []
+  if isinstance(raw_tests, Mapping):
+    return dict(raw_tests)
+  if isinstance(raw_tests, Sequence) and not isinstance(raw_tests, (str, bytes)):
+    return list(raw_tests)
+  if isinstance(raw_tests, Iterable) and not isinstance(raw_tests, (str, bytes)):
+    return list(raw_tests)
+  return raw_tests
 
-  if fmt == "stdio":
-    if not isinstance(parsed, Mapping):
-      raise ValueError(
-          "Dataset record with format='stdio' must provide a dict 'tests' with 'inputs' and 'outputs'"
-      )
+
+def _normalize_stdio_tests(parsed: Any) -> dict[str, Any]:
+  """Validates and normalizes `tests` payload for `stdio` format."""
+  if isinstance(parsed, Mapping):
     inputs = list(parsed.get("inputs", []))
     outputs = list(parsed.get("outputs", []))
     if not inputs or len(inputs) != len(outputs):
@@ -57,26 +61,74 @@ def _normalize_tests(raw_tests: Any, fmt: str) -> list[str] | dict[str, Any]:
         "inputs": [str(x) for x in inputs],
         "outputs": [str(x) for x in outputs],
     }
+  if (
+      isinstance(parsed, Sequence)
+      and not isinstance(parsed, (str, bytes))
+      and parsed
+      and all(isinstance(x, Mapping) for x in parsed)
+  ):
+    inputs = [str(x.get("input", "")) for x in parsed]
+    outputs = [str(x.get("output", "")) for x in parsed]
+    if not inputs or len(inputs) != len(outputs):
+      raise ValueError(
+          "Dataset record with format='stdio' requires non-empty equal-length 'inputs' and 'outputs'"
+      )
+    return {
+        "format": "stdio",
+        "inputs": inputs,
+        "outputs": outputs,
+    }
+  raise ValueError(
+      "Dataset record with format='stdio' must provide a dict 'tests' with 'inputs' and 'outputs'"
+  )
 
+
+def _normalize_assert_tests(parsed: Any) -> list[str]:
+  """Validates and normalizes `tests` payload for `asserts` format."""
   if isinstance(parsed, Mapping):
     if "asserts" in parsed:
       assert_list = [str(x) for x in parsed["asserts"] if str(x).strip()]
-    elif "inputs" in parsed and "outputs" in parsed:
-      inputs = [str(x) for x in parsed["inputs"]]
-      outputs = [str(x) for x in parsed["outputs"]]
-      if not inputs or len(inputs) != len(outputs):
-        raise ValueError("Invalid stdio test dictionary in dataset record")
-      return {"format": "stdio", "inputs": inputs, "outputs": outputs}
     else:
       assert_list = []
-  elif isinstance(parsed, Iterable):
+  elif isinstance(parsed, Iterable) and not isinstance(parsed, (str, bytes)):
     assert_list = [str(x) for x in parsed if str(x).strip()]
   else:
     assert_list = []
-
   if not assert_list:
     raise ValueError("Dataset record missing non-empty 'tests'")
   return assert_list
+
+
+def _normalize_tests(raw_tests: Any, fmt: str) -> list[str] | dict[str, Any]:
+  """Validates and normalizes `tests` payload for `asserts` or `stdio` format."""
+  parsed = _parse_raw_tests(raw_tests)
+  if fmt in ("stdio", "stdin"):
+    return _normalize_stdio_tests(parsed)
+  if isinstance(parsed, Mapping) and "inputs" in parsed and "outputs" in parsed:
+    return _normalize_stdio_tests(parsed)
+  if (
+      isinstance(parsed, Sequence)
+      and not isinstance(parsed, (str, bytes))
+      and bool(parsed)
+      and all(isinstance(x, Mapping) and ("input" in x or "output" in x) for x in parsed)
+  ):
+    return _normalize_stdio_tests(parsed)
+  return _normalize_assert_tests(parsed)
+
+
+class MinimalTokenizer:
+  """Lightweight tokenizer mock for coding RL dataset processing and testing."""
+
+  def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+    del add_special_tokens
+    return [1] * max(1, len(text.split()))
+
+  def decode(self, tokens: Sequence[int], skip_special_tokens: bool = False) -> str:
+    del skip_special_tokens
+    return " ".join(str(t) for t in tokens)
+
+
+_MinimalTok = MinimalTokenizer
 
 
 def process_code_rl_record(record: Mapping[str, Any]) -> dict[str, Any]:

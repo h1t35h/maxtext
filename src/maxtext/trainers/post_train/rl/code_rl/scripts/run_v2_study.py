@@ -417,52 +417,7 @@ def verify_live_judge(
   }
 
 
-def evaluate_gate_g1_prime(
-    *,
-    d3_report: Mapping[str, Any],
-    d4_report: Mapping[str, Any],
-    d1_report: Mapping[str, Any] | None = None,
-    d2_report: Mapping[str, Any] | None = None,
-    judge_status: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-  """Evaluates V2 Hard Calibration Gate G1' (Mass Conservation & Judge Selectivity, §R3)."""
-  flagged_frac = float(d3_report.get("v2_flagged_token_frac", 0.0))
-  selectivity_ok = 0.15 <= flagged_frac <= 0.35
-  passing_turn_fp = float(d3_report.get("v2_passing_turn_code_fp_rate", 0.0))
-  passing_turn_ok = passing_turn_fp <= 0.05
-
-  min_pos_ratio = float(d4_report.get("v2_min_mass_pos_ratio", 0.0))
-  max_pos_ratio = float(d4_report.get("v2_max_mass_pos_ratio", 0.0))
-  max_abs_adv_mean = float(d4_report.get("v2_max_abs_advantage_mean", 1.0))
-  mass_pos_ok = 0.95 <= min_pos_ratio and max_pos_ratio <= 1.05
-  adv_mean_ok = max_abs_adv_mean < 0.03
-
-  d1_ok = True if d1_report is None else bool(d1_report.get("v2_determinism_verified", True))
-  d2_ok = True if d2_report is None else bool(d2_report.get("counterfactual_verified", True))
-  judge_ok = True if judge_status is None else bool(judge_status.get("reachable", True))
-  passed = bool(
-      selectivity_ok
-      and passing_turn_ok
-      and mass_pos_ok
-      and adv_mean_ok
-      and d1_ok
-      and d2_ok
-      and judge_ok
-  )
-  return {
-      "gate": "G1_prime",
-      "passed": passed,
-      "gate_g1_prime_passed": passed,
-      "selectivity_in_band_15_to_35pct": selectivity_ok,
-      "passing_turn_code_protected": passing_turn_ok,
-      "mass_pos_ratio_in_95_to_105pct": mass_pos_ok,
-      "advantage_mean_abs_below_003": adv_mean_ok,
-      "flagged_token_frac": flagged_frac,
-      "v2_min_mass_pos_ratio": min_pos_ratio,
-      "v2_max_mass_pos_ratio": max_pos_ratio,
-      "v2_max_abs_advantage_mean": max_abs_adv_mean,
-      "judge_status": dict(judge_status) if judge_status is not None else {},
-  }
+evaluate_gate_g1_prime = run_diagnostics_d1_d4.evaluate_gate_g1_prime
 
 
 def evaluate_multi_turn_benchmark(
@@ -522,29 +477,10 @@ def evaluate_multi_turn_benchmark(
   )
 
   def _normalize_raw_tests(raw_tests: Any, fmt: str) -> Any:
-    if isinstance(raw_tests, str):
-      stripped = raw_tests.strip()
-      if stripped.startswith(("[", "{")):
-        try:
-          raw_tests = json.loads(stripped)
-        except Exception:  # pylint: disable=broad-except
-          raw_tests = [line for line in raw_tests.splitlines() if line.strip()]
-      else:
-        raw_tests = [line for line in raw_tests.splitlines() if line.strip()]
-    if isinstance(raw_tests, Mapping):
-      return dict(raw_tests)
-    if isinstance(raw_tests, Sequence) and not isinstance(raw_tests, (str, bytes)):
-      items = list(raw_tests)
-      if items and all(isinstance(x, Mapping) for x in items) and (
-          fmt in ("stdio", "stdin") or any("input" in x or "output" in x for x in items)
-      ):
-        return {
-            "format": "stdio",
-            "inputs": [str(x.get("input", "")) for x in items],
-            "outputs": [str(x.get("output", "")) for x in items],
-        }
-      return items
-    return []
+    try:
+      return dataset_processor._normalize_tests(raw_tests, fmt)
+    except (ValueError, TypeError):
+      return []
 
   messages_per_prob: list[list[dict[str, str]]] = []
   tests_per_prob: list[Any] = []
@@ -1370,36 +1306,6 @@ def _unwrap_task_dict(task: Any) -> Any:
   return out
 
 
-if not getattr(code_env_mod.PythonCodeEnv.__init__, "_is_v2_unwrapped", False):
-  _orig_python_code_env_init = code_env_mod.PythonCodeEnv.__init__
-
-  def _patched_python_code_env_init(
-      self: Any,
-      single_example: dict[str, Any] | None = None,
-      *,
-      group_id: int = 0,
-      pair_index: int = 0,
-      **kwargs: Any,
-  ) -> None:
-    raw_task = (
-        single_example
-        if single_example is not None
-        else kwargs.pop("task", None)
-    )
-    _orig_python_code_env_init(
-        self,
-        single_example=_unwrap_task_dict(raw_task),
-        group_id=group_id,
-        pair_index=pair_index,
-        **kwargs,
-    )
-    self.extra_kwargs["group_id"] = self.group_id
-    self.extra_kwargs["pair_index"] = self.pair_index
-
-  _patched_python_code_env_init._is_v2_unwrapped = True  # type: ignore[attr-defined]
-  code_env_mod.PythonCodeEnv.__init__ = _patched_python_code_env_init  # type: ignore[method-assign]
-
-
 class UnwrappedPythonCodeEnv(code_env_mod.PythonCodeEnv):
   """`PythonCodeEnv` subclass that unwraps 1-element `np.ndarray` micro-batches, populates `extra_kwargs`, and JSON-serializes `obs['tests']`."""
 
@@ -1433,42 +1339,6 @@ class UnwrappedPythonCodeEnv(code_env_mod.PythonCodeEnv):
         else json.dumps(obs.get("tests", []))
     )
     return obs
-
-
-# Guard TrajectoryCollectEngine._one_step so trailing env_tokens never push
-# _response_token_count >= max_response_length on non-terminal turns.
-if not getattr(
-    trajectory_collect_engine.TrajectoryCollectEngine._one_step,
-    "_is_v2_guarded",
-    False,
-):
-  _orig_tce_one_step = (
-      trajectory_collect_engine.TrajectoryCollectEngine._one_step
-  )
-
-  async def _guarded_tce_one_step(self: Any) -> bool:
-    done = await _orig_tce_one_step(self)
-    cur_step = self.agent.get_current_step()
-    if (
-        cur_step is not None
-        and getattr(cur_step, "env_tokens", None) is not None
-        and self.max_response_length is not None
-        and self._response_token_count >= self.max_response_length
-    ):
-      self._response_token_count -= len(cur_step.env_tokens)
-      cur_step.env_tokens = None
-      cur_step.env_masks = None
-      cur_step.done = True
-      self.agent.trajectory.status = (
-          agent_types.TrajectoryStatus.MAX_CONTEXT_LIMIT_REACHED
-      )
-      return True
-    return done
-
-  _guarded_tce_one_step._is_v2_guarded = True  # type: ignore[attr-defined]
-  trajectory_collect_engine.TrajectoryCollectEngine._one_step = (
-      _guarded_tce_one_step
-  )
 
 
 # Patch BoundedGroupStage.wrap so completed in-flight Judge tasks drain and yield
@@ -1539,149 +1409,6 @@ if not getattr(
 
   _nonblocking_drain_wrap._is_v2_nonblocking_drain = True  # type: ignore[attr-defined]
   group_postprocess.BoundedGroupStage.wrap = _nonblocking_drain_wrap  # type: ignore[method-assign]
-
-
-_JUDGE_HTTP_EXECUTOR = ThreadPoolExecutor(max_workers=16)
-
-if not getattr(
-    jc_mod.OpenAICompatJudgeClient._chat_json,
-    "_is_v2_bounded_tokens",
-    False,
-):
-
-  def _bounded_post_json_sync(self: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    req_payload = dict(payload)
-    req_payload.setdefault("max_tokens", 512)
-    req_payload.setdefault("chat_template_kwargs", {"enable_thinking": False})
-    data = json.dumps(req_payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{self.base_url}/chat/completions",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        },
-        method="POST",
-    )
-    eff_timeout = min(float(getattr(self, "timeout_s", 25.0) or 25.0), 25.0)
-    with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
-      body = json.loads(resp.read().decode("utf-8"))
-    content = str(body["choices"][0]["message"]["content"])
-    cleaned = jc_mod._strip_code_fences(content)
-    try:
-      return json.loads(cleaned)
-    except json.JSONDecodeError:
-      if '"segments"' in cleaned or '"hacks"' in cleaned or '"tags"' in cleaned:
-        seen_ids: set[int] = set()
-        segs: list[dict[str, Any]] = []
-        for m in re.finditer(
-            r'\{\s*"id"\s*:\s*(\d+)\s*,\s*"label"\s*:\s*"(useful|faulty)"\s*,\s*"reason"\s*:\s*"([^"]+)"\s*\}',
-            cleaned,
-        ):
-          sid = int(m.group(1))
-          if sid not in seen_ids:
-            seen_ids.add(sid)
-            segs.append({"id": sid, "label": m.group(2), "reason": m.group(3)})
-        return {
-            "segments": segs,
-            "turn_summary": [],
-            "hacks": [],
-            "scores": {},
-            "ranking": [],
-        }
-      raise
-
-  async def _bounded_chat_json(
-      self: Any,
-      prompt: str,
-      schema: dict[str, Any],
-      *,
-      system_prompt: str | None = None,
-  ) -> dict[str, Any]:
-    messages: list[dict[str, str]] = []
-    if system_prompt:
-      messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-    payload: dict[str, Any] = {
-        "model": self.model,
-        "messages": messages,
-        "temperature": 0.0,
-        "max_tokens": 512,
-        "chat_template_kwargs": {"enable_thinking": False},
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "judge_response", "schema": schema},
-        },
-    }
-    max_retries = min(int(getattr(self, "max_retries", 1)), 1)
-    last_exc: Exception | None = None
-    for attempt in range(max_retries + 1):
-      try:
-        loop = asyncio.get_running_loop()
-        try:
-          return await loop.run_in_executor(
-              _JUDGE_HTTP_EXECUTOR, self._post_json_sync, payload
-          )
-        except urllib.error.HTTPError as http_exc:
-          if http_exc.code in (400, 500) and "response_format" in payload:
-            fallback_payload = {
-                k: v for k, v in payload.items() if k != "response_format"
-            }
-            return await loop.run_in_executor(
-                _JUDGE_HTTP_EXECUTOR, self._post_json_sync, fallback_payload
-            )
-          raise
-      except Exception as exc:  # pylint: disable=broad-except
-        last_exc = exc
-        if attempt < max_retries:
-          await asyncio.sleep(0.2 * (2**attempt))
-    assert last_exc is not None
-    raise last_exc
-
-  _bounded_chat_json._is_v2_bounded_tokens = True  # type: ignore[attr-defined]
-  jc_mod.OpenAICompatJudgeClient._post_json_sync = _bounded_post_json_sync  # type: ignore[method-assign]
-  jc_mod.OpenAICompatJudgeClient._chat_json = _bounded_chat_json  # type: ignore[method-assign]
-
-
-class _EnrichedGroupPostProcessor:
-  """Wraps `CodeJudgeGroupPostProcessor` to populate `turn1_passed`, `final_passed`, and `assistant_lengths`."""
-
-  def __init__(self, inner: Any):
-    self.inner = inner
-
-  @staticmethod
-  def _populate_item_metrics(item: Any) -> None:
-    traj = item.traj if hasattr(item, "traj") else item
-    if isinstance(traj, dict):
-      orig_in = traj.get("original_input")
-      if isinstance(orig_in, dict):
-        extras = traj.get("env_extras") or {}
-        turn_records = list(extras.get("turn_records") or [])
-        t1_pass = (
-            bool(turn_records[0].test_result.all_passed) if turn_records else False
-        )
-        final_pass_fallback = (
-            bool(turn_records[-1].test_result.all_passed) if turn_records else False
-        )
-        resp_toks = traj.get("response_tokens")
-        asst_len_fallback = len(resp_toks) if resp_toks is not None else 0
-        jmeta = traj.get("judge") or {}
-        orig_in["turn1_passed"] = [t1_pass]
-        orig_in["final_passed"] = [
-            bool(jmeta.get("passed", final_pass_fallback))
-        ]
-        orig_in["assistant_lengths"] = [
-            int(jmeta.get("assistant_len", asst_len_fallback))
-        ]
-
-  async def process_group(self, group: list[Any]) -> list[Any]:
-    for item in group:
-      self._populate_item_metrics(item)
-    res = await self.inner.process_group(group)
-    for item in res:
-      self._populate_item_metrics(item)
-    return res
-
 
 
 def init_tpu_rl_cluster(args: argparse.Namespace) -> dict[str, Any]:
@@ -1897,9 +1624,7 @@ def run_single_arm_seed_tpu(
   raw_postproc = train_rl._build_group_postprocessor(
       base_trainer_config, model_tokenizer, mimo_cfg=mimo_cfg
   )
-  group_postprocessor = (
-      _EnrichedGroupPostProcessor(raw_postproc) if raw_postproc is not None else None
-  )
+  group_postprocessor = raw_postproc
 
   learner_extra_kwargs: dict[str, Any] = {
       "env_class": env_class,

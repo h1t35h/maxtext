@@ -493,27 +493,16 @@ def _build_group_postprocessor(
       "tokenizer": model_tokenizer,
       "mimo_config": mimo_cfg,
       "judge_base_url": judge_base_url,
-      "base_url": judge_base_url,
       "judge_model": judge_model,
-      "model": judge_model,
       "local_rules_only": not bool(judge_base_url),
-      "judge_max_in_flight_groups": judge_max_in_flight_groups,
-      "max_in_flight_groups": judge_max_in_flight_groups,
-      "max_in_flight": judge_max_in_flight_groups,
-      "judge_timeout_s": judge_timeout_s,
-      "stage_timeout_s": judge_timeout_s,
-      "timeout_s": judge_timeout_s,
       "gar_rank_rho": gar_rank_rho,
-      "rho": gar_rank_rho,
       "max_faulty_segments_per_turn": max_flagged_per_turn,
-      "max_flagged_segments_per_turn": max_flagged_per_turn,
-      "judge_max_flagged_segments_per_turn": max_flagged_per_turn,
   }
   try:
     params = inspect.signature(target).parameters
   except (ValueError, TypeError):
     params = {}
-  if "client" in params or "judge_client" in params:
+  if "judge_client" in params or "client" in params:
     try:
       from tunix.rl.agentic.environments.code import judge_client as jc_mod  # pylint: disable=import-outside-toplevel
 
@@ -529,11 +518,46 @@ def _build_group_postprocessor(
         )
       else:
         client = getattr(jc_mod, "MockJudgeClient")()
-      candidate_kwargs["client"] = client
       candidate_kwargs["judge_client"] = client
+      if "client" in params and "judge_client" not in params:
+        candidate_kwargs["client"] = client
     except ImportError:
       pass
   return target(**_kwargs_supported_by(target, **candidate_kwargs))
+
+
+def _build_common_grpo_kwargs(
+    trainer_config: types.RLConfig,
+    mimo_cfg: Any,
+    gspo_pool_mode: str,
+) -> dict[str, Any]:
+  """Returns the common kwargs shared by AgenticGrpoConfig and GrpoConfig."""
+  return {
+      "num_generations": trainer_config.rl.num_generations,
+      "num_iterations": trainer_config.rl.num_iterations,
+      "beta": trainer_config.rl.grpo_beta,
+      "epsilon": trainer_config.rl.grpo_epsilon,
+      "loss_algo": trainer_config.rl.loss_algo,
+      "loss_agg_mode": trainer_config.rl.loss_agg_mode,
+      "epsilon_high": trainer_config.rl.epsilon_high,
+      "use_rollout_logps": trainer_config.rl.use_rollout_logps,
+      "gspo_pool_mode": gspo_pool_mode,
+      "reward_num_workers": getattr(trainer_config, "reward_num_workers", 0),
+      "reward_worker_timeout_seconds": getattr(trainer_config, "reward_worker_timeout_seconds", None),
+      "advantage_estimator": trainer_config.rl.advantage_estimator,
+      "clip_mode": trainer_config.rl.clip_mode,
+      "epsilon_neg": trainer_config.rl.epsilon_neg,
+      "epsilon_neg_high": trainer_config.rl.epsilon_neg_high,
+      "token_advantage_mode": trainer_config.rl.token_advantage_mode,
+      "mimo": mimo_cfg,
+      "exact_token_continuity": trainer_config.rl.exact_token_continuity,
+      "sampler_is": trainer_config.rl.sampler_is,
+      "sampler_is_threshold": trainer_config.rl.sampler_is_threshold,
+      "sampler_rs": trainer_config.rl.sampler_rs,
+      "sampler_rs_min": trainer_config.rl.sampler_rs_min,
+      "sampler_rs_max": trainer_config.rl.sampler_rs_max,
+      "seq_logprob_error_threshold": trainer_config.rl.seq_logprob_error_threshold,
+  }
 
 
 def build_tunix_rl_configs(
@@ -593,6 +617,7 @@ def build_tunix_rl_configs(
       else "sequence"
   )
 
+  common_grpo_kwargs = _build_common_grpo_kwargs(trainer_config, mimo_cfg, gspo_pool_mode)
   if trainer_config.rl.use_agentic_rollout:
     try:
       from tunix.rl.agentic.agentic_grpo_learner import GrpoConfig as AgenticGrpoConfig  # pylint: disable=import-outside-toplevel
@@ -602,67 +627,15 @@ def build_tunix_rl_configs(
           "Please install tunix with agentic support to use 'use_agentic_rollout'."
       ) from e
     grpo_config = AgenticGrpoConfig(
-        num_generations=trainer_config.rl.num_generations,
-        num_iterations=trainer_config.rl.num_iterations,
-        beta=trainer_config.rl.grpo_beta,
-        epsilon=trainer_config.rl.grpo_epsilon,
-        loss_algo=trainer_config.rl.loss_algo,
-        loss_agg_mode=trainer_config.rl.loss_agg_mode,
         max_response_length=trainer_config.max_target_length - trainer_config.max_prefill_predict_length,
         max_concurrency=trainer_config.rl.max_concurrency,
         off_policy_steps=trainer_config.rl.off_policy_steps,
         system_prompt=trainer_config.rl.system_prompt,
-        epsilon_high=trainer_config.rl.epsilon_high,
-        use_rollout_logps=trainer_config.rl.use_rollout_logps,
-        **_kwargs_supported_by(
-            AgenticGrpoConfig,
-            gspo_pool_mode=gspo_pool_mode,
-            reward_num_workers=getattr(trainer_config, "reward_num_workers", 0),
-            reward_worker_timeout_seconds=getattr(trainer_config, "reward_worker_timeout_seconds", None),
-            advantage_estimator=trainer_config.rl.advantage_estimator,
-            clip_mode=trainer_config.rl.clip_mode,
-            epsilon_neg=trainer_config.rl.epsilon_neg,
-            epsilon_neg_high=trainer_config.rl.epsilon_neg_high,
-            token_advantage_mode=trainer_config.rl.token_advantage_mode,
-            mimo=mimo_cfg,
-            exact_token_continuity=trainer_config.rl.exact_token_continuity,
-            sampler_is=trainer_config.rl.sampler_is,
-            sampler_is_threshold=trainer_config.rl.sampler_is_threshold,
-            sampler_rs=trainer_config.rl.sampler_rs,
-            sampler_rs_min=trainer_config.rl.sampler_rs_min,
-            sampler_rs_max=trainer_config.rl.sampler_rs_max,
-            seq_logprob_error_threshold=trainer_config.rl.seq_logprob_error_threshold,
-        ),
+        **_kwargs_supported_by(AgenticGrpoConfig, **common_grpo_kwargs),
     )
   else:
     grpo_config = GrpoConfig(
-        num_generations=trainer_config.rl.num_generations,
-        num_iterations=trainer_config.rl.num_iterations,
-        beta=trainer_config.rl.grpo_beta,
-        epsilon=trainer_config.rl.grpo_epsilon,
-        loss_algo=trainer_config.rl.loss_algo,
-        loss_agg_mode=trainer_config.rl.loss_agg_mode,
-        **_kwargs_supported_by(
-            GrpoConfig,
-            gspo_pool_mode=gspo_pool_mode,
-            reward_num_workers=getattr(trainer_config, "reward_num_workers", 0),
-            reward_worker_timeout_seconds=getattr(trainer_config, "reward_worker_timeout_seconds", None),
-            advantage_estimator=trainer_config.rl.advantage_estimator,
-            clip_mode=trainer_config.rl.clip_mode,
-            epsilon_high=trainer_config.rl.epsilon_high,
-            epsilon_neg=trainer_config.rl.epsilon_neg,
-            epsilon_neg_high=trainer_config.rl.epsilon_neg_high,
-            token_advantage_mode=trainer_config.rl.token_advantage_mode,
-            mimo=mimo_cfg,
-            use_rollout_logps=trainer_config.rl.use_rollout_logps,
-            exact_token_continuity=trainer_config.rl.exact_token_continuity,
-            sampler_is=trainer_config.rl.sampler_is,
-            sampler_is_threshold=trainer_config.rl.sampler_is_threshold,
-            sampler_rs=trainer_config.rl.sampler_rs,
-            sampler_rs_min=trainer_config.rl.sampler_rs_min,
-            sampler_rs_max=trainer_config.rl.sampler_rs_max,
-            seq_logprob_error_threshold=trainer_config.rl.seq_logprob_error_threshold,
-        ),
+        **_kwargs_supported_by(GrpoConfig, **common_grpo_kwargs),
     )
 
   return training_config, grpo_config
@@ -841,14 +814,14 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
 
   # Create RL trainer
   max_logging.log("Setting up RL trainer...")
+  max_logging.log(
+      "GRPO config resolved:\n"
+      + "\n".join(f"  {k} = {v!r}" for k, v in sorted(dataclasses.asdict(grpo_config).items()))
+  )
   if trainer_config.rl.use_agentic_rollout:
     max_logging.log("Using AgenticGRPOLearner with async online rollouts.")
     from tunix.rl.agentic.agentic_grpo_learner import GrpoLearner as AgenticGrpoLearner  # pylint: disable=import-outside-toplevel
 
-    max_logging.log(
-        "GRPO config resolved:\n"
-        + "\n".join(f"  {k} = {v!r}" for k, v in sorted(dataclasses.asdict(grpo_config).items()))
-    )
     if _is_multi_turn_code_env(trainer_config):
       from maxtext.trainers.post_train.rl.code_rl.metrics import get_code_rl_metrics  # pylint: disable=import-outside-toplevel
 
@@ -892,10 +865,6 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
     )
   else:
     max_logging.log("Using standard GRPOLearner with offline rollouts.")
-    max_logging.log(
-        "GRPO config resolved:\n"
-        + "\n".join(f"  {k} = {v!r}" for k, v in sorted(dataclasses.asdict(grpo_config).items()))
-    )
     rl_trainer = GrpoLearner(
         rl_cluster=rl_cluster,
         reward_fns=reward_fns,
